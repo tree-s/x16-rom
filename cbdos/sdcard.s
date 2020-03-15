@@ -35,6 +35,15 @@
 .endmacro
 .macro debug32 arg1, arg2
 .endmacro
+
+.segment "sdcard_data"
+
+; SD Card command parameter/result buffer
+sd_cmd_param:
+	.res 4
+sd_cmd_chksum:
+	.res 1
+
 .code
 .import spi_rw_byte, spi_r_byte, spi_select_device, spi_deselect
 
@@ -566,13 +575,8 @@ sd_wait:
 ; select sd card, pull CS line to low
 ;---------------------------------------------------------------------
 sd_select_card:
-			ldx #>VERA_SPI
-			stx veramid
-			ldx #VERA_SPI >> 16
-			stx verahi
-			ldx #1
-			stx veralo  ; ctrl reg
-			stx veradat ; ss=1
+	ldx #1
+	stx VERA_SPI_CTRL
 			;TODO FIXME race condition here!
 			
 ; fall through to sd_busy_wait
