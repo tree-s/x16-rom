@@ -172,7 +172,7 @@ buffer_for_channel:
 	jmp cbmdos_GetNxtDirEntry
 
 ; detection
-	jmp sdcard_init
+	jmp cbdos_sdcard_init
 
 cbdos_init:
 	; XXX don't do lazy init
@@ -206,6 +206,12 @@ cbdos_init:
 	jsr set_status_73
 
 	ldx save_x
+	rts
+
+cbdos_sdcard_init:
+	BANKING_START
+	jsr sdcard_init
+	BANKING_END
 	rts
 
 ;****************************************
@@ -791,6 +797,12 @@ read_block:
 	sta cur_buffer_len
 	lda #>$0200
 	sta cur_buffer_len + 1
+; need to check if we're actually down to 0 bytes
+	lda bytes_remaining_for_channel + 0,x
+	ora bytes_remaining_for_channel + 1,x
+	ora bytes_remaining_for_channel + 2,x
+	ora bytes_remaining_for_channel + 3,x
+	beq @read_block2
 	lda #0
 	sta is_last_block_for_channel,x
 	clc
@@ -804,6 +816,7 @@ read_block:
 	sta cur_buffer_len
 	lda bytes_remaining_for_channel + 1,x
 	sta cur_buffer_len + 1
+@read_block2:
 	lda #$ff
 	sta is_last_block_for_channel,x
 	clc
@@ -969,7 +982,7 @@ gt_1000
 :	lda #' '
 :	jsr storedir
 	dex
-	bne :-
+	bpl :-
 
 	lda #$22
 	jsr storedir
