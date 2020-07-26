@@ -18,10 +18,12 @@
 ; Directory operations
 .global fat32_open_dir          ; Open directory with path in fat32_ptr
 .global fat32_read_dirent       ; Read directory entry, result in fat32_dirent
+.global fat32_read_dirent_filtered ; Same as above, but only matching names (fat32_ptr)
 .global fat32_find_dirent       ; Find file with path in fat32_ptr in current directory
 
 .global fat32_chdir             ; Change to directory with path in fat32_ptr
 .global fat32_rename            ; Rename file with path in fat32_ptr to fat32_ptr2
+.global fat32_set_attribute     ; Set attribute of file with path in fat32_ptr
 .global fat32_delete            ; Delete file with path in fat32_ptr
 .global fat32_mkdir             ; Create new directory with path in fat32_ptr
 .global fat32_rmdir             ; Delete empty directory with path in fat32_ptr
@@ -39,6 +41,11 @@
 .global fat32_size
 .global fat32_dirent
 .global sync_sector_buffer
+.global fat32_errno
+
+.global lba_partition
+.global partition_type
+.global partition_blocks
 
 ; TODO:
 ; fat32_seek

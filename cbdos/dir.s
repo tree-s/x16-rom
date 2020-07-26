@@ -1,3 +1,8 @@
+;----------------------------------------------------------------------
+; CBDOS Directory Listing
+;----------------------------------------------------------------------
+; (C)2020 Michael Steil, License: 2-clause BSD
+
 .export open_dir, acptr_dir
 
 ; cmdch.s
@@ -5,6 +10,21 @@
 
 ; fat32.s
 .import fat32_dirent, fat32_get_free_space, fat32_size
+.import fat32_read_dirent_filtered
+
+; main.s
+.import set_errno_status
+
+; functions.s
+.import create_fat32_path_only_dir, create_fat32_path_only_name
+
+.import create_unix_path
+.import unix_path
+.import soft_check_medium_a
+.import medium
+.import parse_cbmdos_filename
+.import buffer
+.import r0s, r0e, r1s, r1e
 
 .include "fat32/fat32.inc"
 .include "fat32/regs.inc"
@@ -33,6 +53,8 @@ dir_eof:
 ;---------------------------------------------------------------
 ;---------------------------------------------------------------
 open_dir:
+	pha ; filename length
+
 	lda #0
 	jsr set_status
 
@@ -40,7 +62,27 @@ open_dir:
 	sta context
 	jsr fat32_set_context
 
-	ldy #0
+	ldx #1
+	ply ; filename length
+	jsr parse_cbmdos_filename
+	bcc :+
+	lda #$30 ; syntax error
+	jmp @open_dir_err
+:	lda medium
+	jsr soft_check_medium_a
+	bcc :+
+	lda #$74 ; drive not ready
+	jmp @open_dir_err
+:
+
+	jsr create_fat32_path_only_dir
+
+	jsr fat32_open_dir
+	bcs :+
+	jsr set_errno_status
+	bra @open_dir_err2
+
+:	ldy #0
 	lda #<DIRSTART
 	jsr storedir
 	lda #>DIRSTART
@@ -80,28 +122,19 @@ open_dir:
 	sty dirbuffer_w
 	stz dirbuffer_r
 
-	lda #<root
-	sta fat32_ptr
-	lda #>root
-	sta fat32_ptr + 1
-
-	jsr fat32_open_dir
-	bcc @open_dir_err
-
 	stz dir_eof
 	clc ; ok
 	rts
 
 @open_dir_err:
+	jsr set_status
+@open_dir_err2:
 	lda context
 	jsr fat32_free_context
 	lda #1
 	sta dir_eof
 	clc ; ok
 	rts
-
-root:
-	.byte '/', 0
 
 ;---------------------------------------------------------------
 ;---------------------------------------------------------------
@@ -125,17 +158,24 @@ acptr_dir:
 ;---------------------------------------------------------------
 read_dir_entry:
 	lda dir_eof
-	beq :+
+	beq @read_entry
 	sec
 	rts
 
-:	jsr fat32_read_dirent
-	bcs :+
-	jmp @read_dir_entry_end
+@read_entry:
 
-:	lda fat32_dirent + dirent::attributes
-	bit #$10 ; = directory
-	bne read_dir_entry
+	jsr create_fat32_path_only_name
+
+	jsr fat32_read_dirent_filtered
+	bcs @found
+	lda fat32_errno
+	beq :+
+	jsr set_errno_status
+:	jmp @read_dir_entry_end
+
+@found:	lda fat32_dirent + dirent::name
+	cmp #'.' ; hide "." and ".."
+	beq @read_entry
 
 	ldy #0
 	lda #1
@@ -170,37 +210,50 @@ read_dir_entry:
 	; find out how many spaces to print
 	lda num_blocks
 	sec
+	sbc #<10000
+	lda num_blocks + 1
+	sbc #>10000
+	bcc @ngt_10000
+	lda #'T' - $40
+	jsr storedir
+	bra @gt_1000
+
+@ngt_10000:
+	lda num_blocks
+	sec
 	sbc #<1000
 	lda num_blocks + 1
 	sbc #>1000
 	bcs @gt_1000
+
 	lda num_blocks
 	sec
 	sbc #<100
 	lda num_blocks + 1
 	sbc #>100
 	bcs @gt_100
+
 	lda num_blocks
 	sec
 	sbc #<10
 	lda num_blocks + 1
 	sbc #>10
 	bcs @gt_10
-	ldx #3
-	bra :+
-@gt_10:
+
 	ldx #2
 	bra :+
-@gt_100:
+@gt_10:
 	ldx #1
 	bra :+
-@gt_1000:
+@gt_100:
 	ldx #0
 :	lda #' '
 :	jsr storedir
 	dex
 	bpl :-
+@gt_1000:
 
+;@gt_10000:
 	lda #$22
 	jsr storedir
 
@@ -220,12 +273,34 @@ read_dir_entry:
 	cpx #16
 	bne :-
 
+	lda fat32_dirent + dirent::attributes
+	bit #$10 ; = directory
+	bne @read_dir_entry_dir
+
 	lda #'P'
 	jsr storedir
 	lda #'R'
 	jsr storedir
 	lda #'G'
 	jsr storedir
+	bra @read_dir_cont
+
+@read_dir_entry_dir:
+	lda #'D'
+	jsr storedir
+	lda #'I'
+	jsr storedir
+	lda #'R'
+	jsr storedir
+
+@read_dir_cont:
+	lda fat32_dirent + dirent::attributes
+	lsr
+	bcc :+
+	lda #'<' ; write protect indicator
+	jsr storedir
+:
+
 	lda #0 ; end of line
 	jsr storedir
 
@@ -284,7 +359,7 @@ read_dir_entry:
 	; the final 0 is missing, because the character transmission
 	; function will send one extra 0 with EOI
 
-	jsr fat32_close
+	jsr fat32_close ; can't fail
 	lda context
 	jsr fat32_free_context
 
