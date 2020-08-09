@@ -12,7 +12,7 @@
 
 ; parser.s
 .import find_wildcards
-.import file_mode
+.import file_type, file_mode
 .import unix_path
 .import create_unix_path
 .import medium
@@ -21,13 +21,13 @@
 .import is_filename_empty
 .import overwrite_flag
 
-; function.s
-.import soft_check_medium_a
-
 ; main.s
 .import context_for_channel
 .import channel
 .import ieee_status
+
+; functions.s
+.import alloc_context
 
 .bss
 
@@ -50,33 +50,38 @@ file_second:
 
 ;---------------------------------------------------------------
 file_open:
-	jsr fat32_alloc_context
-	bcs @alloc_ok
-
-	lda #$70
-	jmp set_status
-
-@alloc_ok:
-	pha
-	jsr fat32_set_context
-
 	ldx #0
 	ldy buffer_len
 	jsr parse_cbmdos_filename
 	bcc :+
 	lda #$30 ; syntax error
-	jmp @open_file_err
-:	lda medium
-	jsr soft_check_medium_a
-	bcc :+
-	lda #$74 ; drive not ready
-	jmp @open_file_err
-:
-	jsr is_filename_empty
+	jmp @open_file_err3
+:	jsr is_filename_empty
 	bne :+
 	lda #$34 ; syntax error (empty filename)
-	jmp @open_file_err
+	jmp @open_file_err3
 :
+
+	; type and mode defaults
+	lda file_type
+	bne :+
+	lda #'S'
+	sta file_type
+:	lda file_mode
+	bne :+
+	lda #'R'
+	sta file_mode
+:
+
+	jsr alloc_context
+	bcs @alloc_ok
+
+	jmp convert_errno_status
+
+@alloc_ok:
+	pha
+	jsr fat32_set_context
+
 	jsr create_unix_path
 	lda #<unix_path
 	sta fat32_ptr + 0
@@ -111,23 +116,7 @@ file_open:
 	lda #$33; syntax error (wildcards)
 	bra @open_file_err
 :	lda overwrite_flag
-	bne @open_create
-
-;;; XXX unify duplicate code
-	jsr fat32_find_dirent
-	bcc @1
-	; exists, but don't overwrite
-	lda #$63
-	bra @open_file_err
-
-@1:	lda fat32_errno
-	beq @open_create
-;;;
-
-	jsr set_errno_status
-	bra @open_file_err2
-
-@open_create:
+	lsr
 	jsr fat32_create
 	bcs :+
 	jsr set_errno_status
@@ -167,6 +156,10 @@ file_open:
 	jsr set_status
 @open_file_err2:
 	pla ; context number
+	jmp fat32_free_context
+
+@open_file_err3:
+	jsr set_status
 	jmp fat32_free_context
 
 ;---------------------------------------------------------------
@@ -266,5 +259,6 @@ status_from_errno:
 	.byte $74 ; ERRNO_NO_FS            = 9  -> DRIVE NOT READY
 	.byte $71 ; ERRNO_FS_INCONSISTENT  = 10 -> DIRECTORY ERROR
 	.byte $26 ; ERRNO_WRITE_PROTECT_ON = 11 -> WRITE PROTECT ON
+	.byte $70 ; ERRNO_OUT_OF_RESOURCES = 12 -> NO CHANNEL
 
 

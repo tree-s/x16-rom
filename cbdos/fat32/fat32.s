@@ -1,9 +1,11 @@
 ;-----------------------------------------------------------------------------
 ; fat32.s
 ; Copyright (C) 2020 Frank van den Hoef
+; Copyright (C) 2020 Michael Steil
 ;
 ; TODO:
 ; - implement fat32_seek
+; - implement timestamps
 ;-----------------------------------------------------------------------------
 
 	.include "fat32.inc"
@@ -13,9 +15,13 @@
 
 	.import sector_buffer, sector_buffer_end, sector_lba
 
+	.import filename_char_ucs2_to_internal, filename_char_internal_to_ucs2
+	.import filename_cp437_to_internal, filename_char_internal_to_cp437
 	.import match_name, match_type
 
-CONTEXT_SIZE = 32
+	; mkfs.s
+	.export load_mbr_sector, write_sector, clear_buffer, set_errno
+
 
 FLAG_IN_USE = 1<<0  ; Context in use
 FLAG_DIRTY  = 1<<1  ; Buffer is dirty
@@ -33,66 +39,181 @@ dirent_lba      .dword   ; Sector containing directory entry for this file
 dirent_bufptr   .word    ; Offset to start of directory entry 
 .endstruct
 
+CONTEXT_SIZE = 32
+
+.if CONTEXT_SIZE * FAT32_CONTEXTS > 256
+.error "Too many FAT32_CONTEXTS to fit into 256 bytes!"
+.endif
+
+.if .sizeof(context) > CONTEXT_SIZE
+.error "struct context too big!"
+.endif
+
+.struct fs
+; Static filesystem parameters
+mounted              .byte         ; Flag to indicate the volume is mounted
+rootdir_cluster      .dword        ; Cluster of root directory
+sectors_per_cluster  .byte         ; Sectors per cluster
+cluster_shift        .byte         ; Log2 of sectors_per_cluster
+lba_partition        .dword        ; Start sector of FAT32 partition
+fat_size             .dword        ; Size in sectors of each FAT table
+lba_fat              .dword        ; Start sector of first FAT table
+lba_data             .dword        ; Start sector of first data cluster
+cluster_count        .dword        ; Total number of cluster on volume
+lba_fsinfo           .dword        ; Sector number of FS info
+; Variables
+free_clusters        .dword        ; Number of free clusters (from FS info)
+free_cluster         .dword        ; Cluster to start search for free clusters, also holds result of find_free_cluster
+cwd_cluster          .dword        ; Cluster of current directory
+.endstruct
+
+FS_SIZE      = 64
+
+.if FS_SIZE * FAT32_VOLUMES > 256
+.error "Too many FAT32_VOLUMES to fit into 256 bytes!"
+.endif
+
+.if .sizeof(fs) > FS_SIZE
+.error "struct fs too big!"
+.endif
+
 	.bss
 _fat32_bss_start:
 
-fat32_size:
-	.res 4 ; dword - Used for fat32_get_free_space result
-fat32_cwd_cluster:
-	.res 4 ; dword - Cluster of current directory
-fat32_dirent:
-	.res 22 ; 22 bytes - Buffer containing decoded directory entry
-fat32_errno:
-	.byte 0 ; byte - last error
-
-; Static filesystem parameters
-rootdir_cluster:     .dword 0      ; Cluster of root directory
-sectors_per_cluster: .byte 0       ; Sectors per cluster
-cluster_shift:       .byte 0       ; Log2 of sectors_per_cluster
-lba_partition:       .dword 0      ; Start sector of FAT32 partition
-partition_type:      .byte 0       ; MBR Partition type
-partition_blocks:    .dword 0      ; Number of blocks in partition
-fat_size:            .dword 0      ; Size in sectors of each FAT table
-lba_fat:             .dword 0      ; Start sector of first FAT table
-lba_data:            .dword 0      ; Start sector of first data cluster
-cluster_count:       .dword 0      ; Total number of cluster on volume
-lba_fsinfo:          .dword 0      ; Sector number of FS info
-
-; Variables
-free_clusters:       .dword 0      ; Number of free clusters (from FS info)
-free_cluster:        .dword 0      ; Cluster to start search for free clusters, also holds result of find_free_cluster
-filename_buf:        .res 11       ; Used for filename conversion
-
-; Temp buffers
+; Temp
 bytecnt:             .word 0       ; Used by fat32_write
 tmp_buf:             .res 4        ; Used by save_sector_buffer, fat32_rename
 next_sector_arg:     .byte 0       ; Used by next_sector to store argument
 tmp_bufptr:          .word 0       ; Used by next_sector
 tmp_sector_lba:      .dword 0      ; Used by next_sector
-
 name_offset:         .byte 0
 tmp_dir_cluster:     .dword 0
+tmp_attrib:          .byte 0       ; temporary: attribute when creating a dir entry
+tmp_dirent_flag:     .byte 0
+shortname_buf:       .res 11       ; Used for shortname creation
+
+; Temp - LFN
+lfn_index:           .byte 0       ; counter when collecting/decoding LFN entries
+lfn_count:           .byte 0       ; number of LFN dir entries when reading/creating
+lfn_checksum:        .byte 0       ; created or expected LFN checksum
+lfn_char_count:      .byte 0       ; counter when decoding LFN characters
+lfn_name_index:      .byte 0       ; counter when decoding LFN characters
+tmp_sfn_case:        .byte 0       ; flags when decoding SFN characters
+free_entry_count:    .byte 0       ; counter when looking for contig. free dir entries
+marked_entry_lba:    .res 4        ; mark/rewind data for directory entries
+marked_entry_cluster:.res 4
+marked_entry_offset: .res 2
+tmp_entry:           .res 21       ; SFN entry fields except name, saved during rename
+lfn_buf:             .res 20*32    ; create/collect LFN; 20 dirents (13c * 20 > 255c)
+
+; API arguments and return data
+fat32_dirent:        .tag dirent   ; Buffer containing decoded directory entry
+fat32_size:          .res 4        ; Used for fat32_read, fat32_write, fat32_get_offset, fat32_get_free_space
+fat32_errno:         .byte 0       ; Last error
+fat32_readonly:      .byte 0       ; User-accessible read-only flag
 
 ; Contexts
 context_idx:         .byte 0       ; Index of current context
 cur_context:         .tag context  ; Current file descriptor state
 contexts_inuse:      .res FAT32_CONTEXTS
+.if ::FAT32_VOLUMES > 1
+volume_for_context:  .res FAT32_CONTEXTS
+.endif
+
+; Volumes
+volume_idx:          .byte 0       ; Index of current filesystem
+cur_volume:          .tag fs       ; Current file descriptor state
 
 .if FAT32_CONTEXTS > 1
 contexts:            .res CONTEXT_SIZE * FAT32_CONTEXTS
 .endif
 
-.if CONTEXT_SIZE * FAT32_CONTEXTS > 256
-.error "FAT32_CONTEXTS > 8"
-.endif
-
-.if .sizeof(context) > CONTEXT_SIZE
-.error "Context too big"
+.if FAT32_VOLUMES > 1
+volumes:             .res FS_SIZE * FAT32_VOLUMES
 .endif
 
 _fat32_bss_end:
 
 	.code
+
+;-----------------------------------------------------------------------------
+; set_volume
+;
+; In:  a volume
+;
+; * c=0: failure
+;-----------------------------------------------------------------------------
+set_volume:
+	; Already selected?
+	cmp volume_idx
+	bne @0
+	sec
+	rts
+
+@0:
+	; Valid volume index?
+	cmp #FAT32_VOLUMES
+	bcc @ok
+
+	lda #ERRNO_NO_FS
+	jmp set_errno
+
+@ok:
+.if ::FAT32_VOLUMES > 1
+	; Save new volume index
+	pha
+
+	.assert FS_SIZE = 64, error
+	; Copy current volume back
+	lda volume_idx
+	bmi @dont_write_back ; < 0 = no current volume
+	asl ; X=A*64
+	asl
+	asl
+	asl
+	asl
+	asl
+	tax
+
+	ldy #0
+@1:	lda cur_volume, y
+	sta volumes, x
+	inx
+	iny
+	cpy #(.sizeof(fs))
+	bne @1
+
+@dont_write_back:
+	; Copy new volume to current
+	pla              ; Get new volume idx
+	pha
+	asl ; X=A*64
+	asl
+	asl
+	asl
+	asl
+	asl
+	tax
+
+	ldy #0
+@2:	lda volumes, x
+	sta cur_volume, y
+	inx
+	iny
+	cpy #(.sizeof(fs))
+	bne @2
+
+	pla
+.endif
+
+	sta volume_idx
+	bit cur_volume + fs::mounted
+	bmi @done
+	lda volume_idx
+	jmp fat32_mount
+@done:
+	sec
+	rts
 
 ;-----------------------------------------------------------------------------
 ; set_errno
@@ -150,34 +271,47 @@ load_sector_buffer:
 	jmp set_errno
 
 ;-----------------------------------------------------------------------------
+; write_sector
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+write_sector:
+	lda fat32_readonly
+	bne @error
+	jmp sdcard_write_sector
+
+@error:	lda #ERRNO_WRITE_PROTECT_ON
+	jmp set_errno
+
+;-----------------------------------------------------------------------------
 ; save_sector_buffer
 ;
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
 save_sector_buffer:
 	; Determine if this is FAT area write (sector_lba - lba_fat < fat_size)
-	sub32 tmp_buf, sector_lba, lba_fat
+	sub32 tmp_buf, sector_lba, cur_volume + fs::lba_fat
 	lda tmp_buf + 2
 	ora tmp_buf + 3
 	bne @normal
 	sec
 	lda tmp_buf + 0
-	sbc fat_size + 0
+	sbc cur_volume + fs::fat_size + 0
 	lda tmp_buf + 1
-	sbc fat_size + 1
+	sbc cur_volume + fs::fat_size + 1
 	bcs @normal
 
 	; Write second FAT
 	set32 tmp_buf, sector_lba
-	add32 sector_lba, sector_lba, fat_size
-	jsr sdcard_write_sector
+	add32 sector_lba, sector_lba, cur_volume + fs::fat_size
+	jsr write_sector
 	php
 	set32 sector_lba, tmp_buf
 	plp
 	bcc @error_write
 
 @normal:
-	jsr sdcard_write_sector
+	jsr write_sector
 	bcc @error_write
 
 	; Clear dirty bit
@@ -198,14 +332,14 @@ save_sector_buffer:
 calc_cluster_lba:
 	; lba = lba_data + ((cluster - 2) << cluster_shift)
 	sub32_val cur_context + context::lba, cur_context + context::cluster, 2
-	ldy cluster_shift
+	ldy cur_volume + fs::cluster_shift
 	beq @shift_done
 @1:	shl32 cur_context + context::lba
 	dey
 	bne @1
 @shift_done:
 
-	add32 cur_context + context::lba, cur_context + context::lba, lba_data
+	add32 cur_context + context::lba, cur_context + context::lba, cur_volume + fs::lba_data
 	stz cur_context + context::cluster_sector
 	rts
 
@@ -234,7 +368,7 @@ load_fat_sector_for_cluster:
 	rol cur_context + context::lba + 1
 	rol cur_context + context::lba + 2
 	rol cur_context + context::lba + 3
-	add32 cur_context + context::lba, cur_context + context::lba, lba_fat
+	add32 cur_context + context::lba, cur_context + context::lba, cur_volume + fs::lba_fat
 
 	; Read FAT sector
 	jsr load_sector_buffer
@@ -330,26 +464,26 @@ unlink_cluster_chain:
 @0:
 	; Set this cluster as new search start point if lower than current start point
 	ldy #3
-	lda free_cluster + 3
+	lda cur_volume + fs::free_cluster + 3
 	cmp (fat32_bufptr), y
 	bcc @2
 	dey
-	lda free_cluster + 2
+	lda cur_volume + fs::free_cluster + 2
 	cmp (fat32_bufptr), y
 	bcc @2
 	dey
-	lda free_cluster + 1
+	lda cur_volume + fs::free_cluster + 1
 	cmp (fat32_bufptr), y
 	bcc @2
 	dey
-	lda free_cluster + 0
+	lda cur_volume + fs::free_cluster + 0
 	cmp (fat32_bufptr), y
 	bcc @2
 	beq @2
 
 	ldy #0
 @1:	lda (fat32_bufptr), y
-	sta free_cluster, y
+	sta cur_volume + fs::free_cluster, y
 	iny
 	cpy #4
 	bne @1
@@ -366,7 +500,7 @@ unlink_cluster_chain:
 	sta (fat32_bufptr), y
 
 	; Increment free clusters
-	inc32 free_clusters
+	inc32 cur_volume + fs::free_clusters
 
 	; Set sector as dirty
 	lda cur_context + context::flags
@@ -389,7 +523,7 @@ unlink_cluster_chain:
 ;-----------------------------------------------------------------------------
 find_free_cluster:
 	; Start search at free_cluster
-	set32 cur_context + context::cluster, free_cluster
+	set32 cur_context + context::cluster, cur_volume + fs::free_cluster
 	jsr load_fat_sector_for_cluster
 	bcs @next
 	rts
@@ -407,7 +541,7 @@ find_free_cluster:
 	bne @not_free
 
 	; Return found free cluster
-	set32 free_cluster, cur_context + context::cluster
+	set32 cur_volume + fs::free_cluster, cur_context + context::cluster
 	sec
 	rts
 
@@ -419,7 +553,7 @@ find_free_cluster:
 	inc32 cur_context + context::cluster
 
 	; Check if at end of FAT table
-	cmp32_ne cur_context + context::cluster, cluster_count, @1
+	cmp32_ne cur_context + context::cluster, cur_volume + fs::cluster_count, @1
 	clc
 	rts
 @1:
@@ -434,8 +568,22 @@ find_free_cluster:
 
 ;-----------------------------------------------------------------------------
 ; fat32_alloc_context
+;
+; In:  a     volume
+; Out: a     context
+;      c     =0: failure
+;      errno =ERRNO_OUT_OF_RESOURCES: all contexts in use
+;            =ERRNO_READ            : error mounting volume
+;            =ERRNO_WRITE           : error mounting volume
+;            =ERRNO_NO_FS           : error mounting volume
+;            =ERRNO_FS_INCONSISTENT : error mounting volume
 ;-----------------------------------------------------------------------------
 fat32_alloc_context:
+	stz fat32_errno
+
+.if FAT32_VOLUMES > 1
+	tay ; volume
+.endif
 	ldx #0
 @1:	lda contexts_inuse, x
 	beq @found_free
@@ -443,20 +591,38 @@ fat32_alloc_context:
 	cpx #FAT32_CONTEXTS
 	bne @1
 
-@fat32_alloc_context_error:
-	clc
-	rts
+	lda #ERRNO_OUT_OF_RESOURCES
+	jmp set_errno
 
 @found_free:
 	lda #1
 	sta contexts_inuse, x
+
+.if FAT32_VOLUMES > 1
+	tya
+	sta volume_for_context, x
+	phx
+	cmp #$ff
+	sec
+	beq @2
+	jsr set_volume
+@2:	pla
+	bcs @rts
+	jsr fat32_free_context
+	clc
+	rts
+.else
 	txa
 	sec
-@fat32_alloc_context_ok:
+.endif
+@rts:
 	rts
 
 ;-----------------------------------------------------------------------------
 ; fat32_free_context
+;
+; In:  a     context
+; Out: c     =0: failure
 ;-----------------------------------------------------------------------------
 fat32_free_context:
 	cmp #FAT32_CONTEXTS
@@ -478,13 +644,13 @@ fat32_free_context:
 ;-----------------------------------------------------------------------------
 update_fs_info:
 	; Load FS info sector
-	set32 cur_context + context::lba, lba_fsinfo
+	set32 cur_context + context::lba, cur_volume + fs::lba_fsinfo
 	jsr load_sector_buffer
 	bcs @1
 	rts
 @1:
 	; Get number of free clusters
-	set32 sector_buffer + 488, free_clusters
+	set32 sector_buffer + 488, cur_volume + fs::free_clusters
 
 	; Save sector
 	jmp save_sector_buffer
@@ -519,128 +685,107 @@ allocate_cluster:
 	rts
 @2:
 	; Decrement free clusters and update FS info
-	dec32 free_clusters
+	dec32 cur_volume + fs::free_clusters
 	jmp update_fs_info
 
 ;-----------------------------------------------------------------------------
 ; validate_char
 ;-----------------------------------------------------------------------------
 validate_char:
-	; Allowed: 33, 35-41, 45, 48-57, 64-90, 94-96, 123, 125, 126
-	cmp #33
-	beq @ok
-	cmp #35
-	bcc @not_ok
-	cmp #41+1
-	bcc @ok
-	cmp #45
-	beq @ok
-	cmp #48
-	bcc @not_ok
-	cmp #57+1
-	bcc @ok
-	cmp #64
-	bcc @not_ok
-	cmp #90+1
-	bcc @ok
-	cmp #94
-	bcc @not_ok
-	cmp #96
-	bcc @ok
-	cmp #123
-	beq @ok
-	cmp #125
-	beq @ok
-	cmp #126
-	beq @ok
-
-@not_ok:
-	clc
-	rts
-@ok:	sec
-	rts
-
-;-----------------------------------------------------------------------------
-; convert_filename
-;
-; * c=0: failure; sets errno
-;-----------------------------------------------------------------------------
-convert_filename:
-	ldy name_offset
-
-	; Disallow empty string or string starting with '.'
-	lda (fat32_ptr), y
+	cmp #$22 ; quote
 	beq @not_ok
-	cmp #'.'
+	cmp #'*'
+	beq @not_ok
+	cmp #'/'
+	beq @not_ok
+	cmp #':'
+	beq @not_ok
+	cmp #'<'
+	beq @not_ok
+	cmp #'>'
+	beq @not_ok
+	cmp #'?'
+	beq @not_ok
+	cmp #'\'
+	beq @not_ok
+	cmp #'|'
 	beq @not_ok
 
-	; Copy name part
-	ldx #0
-@loop1:	lda (fat32_ptr), y
-	beq @name_pad
-	cmp #'.'
-	beq @name_pad
-	jsr to_upper
-	jsr validate_char
-	bcc @not_ok
-	sta filename_buf, x
-	inx
-	iny
-	cpx #8
-	bne @loop1
-
-	; Pad name with spaces
-@name_pad:
-	lda #' '
-@loop2:	cpx #8
-	beq @name_pad_done
-	sta filename_buf, x
-	inx
-	bra @loop2
-@name_pad_done:
-
-	; Check next character
-	lda (fat32_ptr), y
-	beq @ext_pad
-	cmp #'.'
-	beq @ext
-	bra @not_ok
-
-	; Copy extension part
-@ext:	iny	; Skip '.'
-
-@loop3:	lda (fat32_ptr), y
-	beq @ext_pad
-	jsr to_upper
-	jsr validate_char
-	bcc @not_ok
-	sta filename_buf, x
-	inx
-	iny
-	cpx #11
-	bne @loop3
-
-	; Check for end of string
-	lda (fat32_ptr), y
-	bne @not_ok
-
-	; Pad extension with spaces
-@ext_pad:
-	lda #' '
-@loop4:	cpx #11
-	beq @ext_pad_done
-	sta filename_buf, x
-	inx
-	bra @loop4
-@ext_pad_done:
-
-	; Done
 	sec
 	rts
 
 @not_ok:
-	lda #ERRNO_ILLEGAL_FILENAME
-	jmp set_errno
+	clc
+	rts
+
+;-----------------------------------------------------------------------------
+; create_shortname
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+create_shortname:
+	ldx #0
+	lda marked_entry_lba + 3
+	jsr hexbuf8
+	lda marked_entry_lba + 2
+	jsr hexbuf8
+	lda marked_entry_lba + 1
+	jsr hexbuf8
+	lda marked_entry_lba + 0
+	jsr hexbuf8
+	lda #'~'
+	sta shortname_buf, x
+	inx
+	lda fat32_bufptr + 0
+	sec
+	sbc #<sector_buffer
+	pha
+	lda fat32_bufptr + 1
+	sbc #>sector_buffer
+	lsr
+	pla
+	ror
+	lsr
+	lsr
+	lsr
+	lsr
+	jsr hexbuf4
+	lda #'~'
+	sta shortname_buf, x
+
+	; Checksum
+	lda #0
+	tay
+@checksum_loop:
+	tax
+	lsr
+	txa
+	ror
+	clc
+	adc shortname_buf, y
+	iny
+	cpy #11
+	bne @checksum_loop
+	sta lfn_checksum
+	rts
+
+hexbuf8:
+	pha
+	lsr
+	lsr
+	lsr
+	lsr
+	jsr hexbuf4
+	pla
+hexbuf4:
+	and #$0f
+	cmp #$0a
+	bcc :+
+	adc #$66
+:	eor #$30
+	sta shortname_buf, x
+	inx
+	rts
 
 ;-----------------------------------------------------------------------------
 ; open_cluster
@@ -653,10 +798,12 @@ open_cluster:
 	ora cur_context + context::cluster + 1
 	ora cur_context + context::cluster + 2
 	ora cur_context + context::cluster + 3
-	bne @readsector
-	set32 cur_context + context::cluster, rootdir_cluster
+	bne readsector
 
-@readsector:
+open_rootdir:
+	set32 cur_context + context::cluster, cur_volume + fs::rootdir_cluster
+
+readsector:
 	; Read first sector of cluster
 	jsr calc_cluster_lba
 	jsr load_sector_buffer
@@ -669,28 +816,35 @@ open_cluster:
 @done:	rts
 
 ;-----------------------------------------------------------------------------
+; clear_buffer
+;-----------------------------------------------------------------------------
+clear_buffer:
+	ldy #0
+	tya
+@1:	sta sector_buffer, y
+	sta sector_buffer + 256, y
+	iny
+	bne @1
+	rts
+
+;-----------------------------------------------------------------------------
 ; clear_cluster
 ;
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
 clear_cluster:
 	; Fill sector buffer with 0
-	lda #0
-	ldy #0
-@1:	sta sector_buffer, y
-	sta sector_buffer + 256, y
-	iny
-	bne @1
+	jsr clear_buffer
 
 	; Write sectors
 	jsr calc_cluster_lba
 @2:	set32 sector_lba, cur_context + context::lba
-	jsr sdcard_write_sector
+	jsr write_sector
 	bcs @3
 	rts
 @3:	lda cur_context + context::cluster_sector
 	inc
-	cmp sectors_per_cluster
+	cmp cur_volume + fs::sectors_per_cluster
 	beq @wrdone
 	sta cur_context + context::cluster_sector
 	inc32 cur_context + context::lba
@@ -714,7 +868,7 @@ next_sector:
 	; Last sector of cluster?
 	lda cur_context + context::cluster_sector
 	inc
-	cmp sectors_per_cluster
+	cmp cur_volume + fs::sectors_per_cluster
 	beq @end_of_cluster
 	sta cur_context + context::cluster_sector
 
@@ -761,7 +915,7 @@ next_sector:
 	
 	; Write allocated cluster number in FAT
 	ldy #0
-@2:	lda free_cluster, y
+@2:	lda cur_volume + fs::free_cluster, y
 	sta (fat32_bufptr), y
 	iny
 	cpy #4
@@ -772,7 +926,7 @@ next_sector:
 	bcc @error
 
 	; Set allocated cluster as current
-	set32 cur_context + context::cluster, free_cluster
+	set32 cur_context + context::cluster, cur_volume + fs::free_cluster
 
 	; Request to clear new cluster?
 	lda next_sector_arg
@@ -824,7 +978,7 @@ find_dirent:
 	rts
 
 @use_current:
-	set32 cur_context + context::cluster, fat32_cwd_cluster
+	set32 cur_context + context::cluster, cur_volume + fs::cwd_cluster
 
 @open:	set32 tmp_dir_cluster, cur_context + context::cluster
 
@@ -866,8 +1020,8 @@ find_dirent:
 
 	sty name_offset
 
-	set32 cur_context + context::cluster, fat32_dirent + dirent::cluster
-	set32 tmp_dir_cluster, fat32_dirent + dirent::cluster
+	set32 cur_context + context::cluster, fat32_dirent + dirent::start
+	set32 tmp_dir_cluster, fat32_dirent + dirent::start
 	jmp @open
 
 ;-----------------------------------------------------------------------------
@@ -919,17 +1073,19 @@ find_dir:
 	rts
 
 ;-----------------------------------------------------------------------------
-; delete_file
+; delete_entry
+;
+; Delete a directory entry. Requires one of find_dirent/find_file/find_dir to
+; be called before.
+;
+; C: 1= ignore read-only bit
 ;
 ; * c=0: failure; sets errno
-; * does not set errno = ERRNO_FILE_NOT_FOUND!
 ;-----------------------------------------------------------------------------
-delete_file:
-	; Find file
-	jsr find_file
-	bcc @error
-
+delete_entry:
 	set16 fat32_bufptr, cur_context + context::dirent_bufptr
+
+	bcs @1 ; ignore read-only
 
 	ldy #11
 	lda (fat32_bufptr),y
@@ -940,19 +1096,59 @@ delete_file:
 	lda #ERRNO_FILE_READ_ONLY
 	jmp set_errno
 
-@1:	; Mark file as deleted
+@1:
+	lda lfn_count
+	beq @delete_lfn_loop
+
+	; rewind to first LFN entry
+	jsr rewind_dir_entry
+
+@delete_lfn_loop:
 	lda #$E5
 	sta (fat32_bufptr)
 
-	; Write sector buffer to disk
 	jsr save_sector_buffer
-	bcc @error
+	bcc @ret
 
+	dec lfn_count
+	bmi @end ; lfn_count + 1 iterations (#LFNs + 1 SFN)
+
+	add16_val fat32_bufptr, fat32_bufptr, 32
+	cmp16_val_ne fat32_bufptr, sector_buffer_end, @delete_lfn_loop
+
+	lda #0
+	jsr next_sector
+	bcs @delete_lfn_loop
+	rts
+
+@end:
+	sec
+@ret:
+	rts
+
+;-----------------------------------------------------------------------------
+; delete_file
+;
+; * c=0: failure; sets errno
+; * does not set errno = ERRNO_FILE_NOT_FOUND!
+;-----------------------------------------------------------------------------
+delete_file:
+	; Find file
+	jsr find_file
+	bcs delete_file2
+@error:
+	rts
+
+delete_file2:
+	clc ; respect read-only bit
+	jsr delete_entry
+	bcs @1
+	rts
+
+@1:
 	; Unlink cluster chain
-	set32 cur_context + context::cluster, fat32_dirent + dirent::cluster
+	set32 cur_context + context::cluster, fat32_dirent + dirent::start
 	jmp unlink_cluster_chain
-
-@error:	rts
 
 ;-----------------------------------------------------------------------------
 ; fat32_init
@@ -960,15 +1156,6 @@ delete_file:
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
 fat32_init:
-	stz fat32_errno
-
-	; Initialize SD card
-	jsr sdcard_init
-	bcs @0
-	lda #ERRNO_NO_MEDIA
-	jmp set_errno
-
-@0:
 	; Clear FAT32 BSS
 	set16_val fat32_bufptr, _fat32_bss_start
 	lda #0
@@ -983,23 +1170,48 @@ fat32_init:
 	cpx #>_fat32_bss_end
 	bne @1
 
+	; Initialize SD card
+	jsr sdcard_init
+	bcs @0
+	lda #ERRNO_NO_MEDIA
+	jmp set_errno
+@0:
+
 	; Make sure sector_lba is non-zero
+	; (was overwritten by sdcard_init)
 	lda #$FF
 	sta sector_lba
 
-	; Set initial start point for free cluster search
-	set32_val free_cluster, 2
+	; No current volume
+	sta volume_idx
 
-	; Read partition table (sector 0)
-	; cur_context::lba already 0
-	jsr load_sector_buffer
+	sec
+	rts
+
+;-----------------------------------------------------------------------------
+; fat32_mount
+;
+; In:  a  partition number (0+)
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+fat32_mount:
+	pha ; partition number
+
+	jsr load_mbr_sector
+	pla
 	bcs @2a
 @error:	clc
 	rts
 
-@2a:	; Check partition type of first partition
-	lda sector_buffer + $1BE + 4
-	sta partition_type
+@2a:	asl ; *16
+	asl
+	asl
+	asl
+	tax
+
+	; Check partition type
+	lda sector_buffer + $1BE + 4, x
 	cmp #$0B
 	beq @3
 	cmp #$0C
@@ -1008,12 +1220,18 @@ fat32_init:
 	jmp set_errno
 
 @3:
-	; Get LBA of first partition
-	set32 lba_partition, sector_buffer + $1BE + 8
-	set32 partition_blocks, sector_buffer + $1BE + 12
+	; Get LBA of partition
+	lda sector_buffer + $1BE + 8 + 0, x
+	sta cur_volume + fs::lba_partition + 0
+	lda sector_buffer + $1BE + 8 + 1, x
+	sta cur_volume + fs::lba_partition + 1
+	lda sector_buffer + $1BE + 8 + 2, x
+	sta cur_volume + fs::lba_partition + 2
+	lda sector_buffer + $1BE + 8 + 3, x
+	sta cur_volume + fs::lba_partition + 3
 
 	; Read first sector of partition
-	set32 cur_context + context::lba, lba_partition
+	set32 cur_context + context::lba, cur_volume + fs::lba_partition
 	jsr load_sector_buffer
 	bcc @error
 
@@ -1037,51 +1255,56 @@ fat32_init:
 
 	; Get sectors per cluster
 	lda sector_buffer + 13
-	sta sectors_per_cluster
+	sta cur_volume + fs::sectors_per_cluster
 	beq @fs_inconsistent
 
 	; Calculate shift amount based on sectors per cluster
 	; cluster_shift already 0
 @4:	lsr
 	beq @5
-	inc cluster_shift
+	inc cur_volume + fs::cluster_shift
 	bra @4
 @5:
 	; FAT size in sectors
-	set32 fat_size, sector_buffer + 36
+	set32 cur_volume + fs::fat_size, sector_buffer + 36
 
 	; Root cluster
-	set32 rootdir_cluster, sector_buffer + 44
+	set32 cur_volume + fs::rootdir_cluster, sector_buffer + 44
 
 	; Calculate LBA of first FAT
-	add32_16 lba_fat, lba_partition, sector_buffer + 14
+	add32_16 cur_volume + fs::lba_fat, cur_volume + fs::lba_partition, sector_buffer + 14
 
 	; Calculate LBA of first data sector
-	add32 lba_data, lba_fat, fat_size
-	add32 lba_data, lba_data, fat_size
+	add32 cur_volume + fs::lba_data, cur_volume + fs::lba_fat, cur_volume + fs::fat_size
+	add32 cur_volume + fs::lba_data, cur_volume + fs::lba_data, cur_volume + fs::fat_size
 
 	; Calculate number of clusters on volume: (total_sectors - lba_data) >> cluster_shift
-	set32 cluster_count, sector_buffer + 32
-	sub32 cluster_count, cluster_count, lba_data
-	ldy cluster_shift
+	set32 cur_volume + fs::cluster_count, sector_buffer + 32
+	sub32 cur_volume + fs::cluster_count, cur_volume + fs::cluster_count, cur_volume + fs::lba_data
+	ldy cur_volume + fs::cluster_shift
 	beq @7
-@6:	shr32 cluster_count
+@6:	shr32 cur_volume + fs::cluster_count
 	dey
 	bne @6
 @7:
 	; Get FS info sector
-	add32_16 lba_fsinfo, lba_partition, sector_buffer + 48
+	add32_16 cur_volume + fs::lba_fsinfo, cur_volume + fs::lba_partition, sector_buffer + 48
 
 	; Load FS info sector
-	set32 cur_context + context::lba, lba_fsinfo
+	set32 cur_context + context::lba, cur_volume + fs::lba_fsinfo
 	jsr load_sector_buffer
 	bcs @8
 	rts
 @8:
 	; Get number of free clusters
-	set32 free_clusters, sector_buffer + 488
+	set32 cur_volume + fs::free_clusters, sector_buffer + 488
+
+	; Set initial start point for free cluster search
+	set32_val cur_volume + fs::free_cluster, 2
 
 	; Success
+	lda #$80
+	sta cur_volume + fs::mounted
 	sec
 	rts
 
@@ -1111,11 +1334,12 @@ fat32_set_context:
 
 	; Save dirty sector
 	jsr sync_sector_buffer
-	bcc @error
+	bcc @error2
 
 	; Put zero page variables in current context
 	set16 cur_context + context::bufptr, fat32_bufptr
 
+	.assert CONTEXT_SIZE = 32, error
 	; Copy current context back
 	lda context_idx   ; X=A*32
 	asl
@@ -1154,6 +1378,14 @@ fat32_set_context:
 	; Restore zero page variables from current context
 	set16 fat32_bufptr, cur_context + context::bufptr
 
+	ldx context_idx
+	lda volume_for_context, x
+	cmp #$ff
+	beq @no_volume
+	jsr set_volume
+	bcc @error
+
+@no_volume:
 	; Reload sector
 	lda cur_context + context::flags
 	bit #FLAG_IN_USE
@@ -1165,6 +1397,8 @@ fat32_set_context:
 
 @done:	sec
 	rts
+@error2:
+	pla
 @error:	clc
 	rts
 
@@ -1199,12 +1433,12 @@ fat32_open_dir:
 	jmp set_errno
 
 @1:
-	set32 cur_context + context::cluster, fat32_dirent + dirent::cluster
+	set32 cur_context + context::cluster, fat32_dirent + dirent::start
 	bra @open
 
 @cur_dir:
 	; Open current directory
-	set32 cur_context + context::cluster, fat32_cwd_cluster
+	set32 cur_context + context::cluster, cur_volume + fs::cwd_cluster
 
 @open:	jsr open_cluster
 	bcc @error
@@ -1242,6 +1476,24 @@ fat32_find_dirent:
 fat32_read_dirent:
 	stz fat32_errno
 
+	sec
+	jmp read_dirent
+
+;-----------------------------------------------------------------------------
+; read_dirent
+;
+; In:   c=1: return next file entry
+;       c=0: return next volume label entry
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+read_dirent:
+	ror
+	sta tmp_dirent_flag
+	stz lfn_index
+	stz lfn_count
+
+@fat32_read_dirent_loop:
 	; Load next sector if at end of buffer
 	cmp16_val_ne fat32_bufptr, sector_buffer_end, @1
 	lda #0
@@ -1250,29 +1502,165 @@ fat32_read_dirent:
 @error:	clc     ; Indicate error
 	rts
 @1:
-	; Skip volume label entries
-	ldy #11
-	lda (fat32_bufptr), y
-	sta fat32_dirent + dirent::attributes
-	and #8
-	beq @2
-	jmp @next_entry
-@2:
 	; Last entry?
-	ldy #0
-	lda (fat32_bufptr), y
+	lda (fat32_bufptr)
 	beq @error
 
 	; Skip empty entries
 	cmp #$E5
 	bne @3
-	jmp @next_entry
+	jmp @next_entry_clear_lfn_buffer
 @3:
+
+	; Volume label entry?
+	ldy #11
+	lda (fat32_bufptr), y
+	sta fat32_dirent + dirent::attributes
+	cmp #8
+	bne @2
+	bit tmp_dirent_flag
+	bpl @2b
+@2a:
+	jmp @next_entry
+@2:
+	bit tmp_dirent_flag
+	bpl @2a
+
+@2b:
+	; check for LFN entry
+	lda fat32_dirent + dirent::attributes
+	cmp #$0f
+	beq @lfn_entry
+	bra @short_entry
+
+@lfn_entry:
+
+	; does it have the right index?
+	jsr check_lfn_index
+	bcs @index_ok
+	jmp @next_entry_clear_lfn_buffer
+@index_ok:
+
+	; first LFN entry?
+	lda lfn_index
+	bne @not_first_lfn_entry
+
+; first LFN entry
+	; init buffer
+	set16_val fat32_lfn_bufptr, lfn_buf
+
+	; save checksum
+	ldy #13
+	lda (fat32_bufptr), y
+	sta lfn_checksum
+
+	; prepare expected index
+	lda (fat32_bufptr)
+	and #$1f
+	sta lfn_index
+	sta lfn_count
+
+	; add entry to buffer
+	jsr add_lfn_entry
+
+	; remember dir entry
+	jsr mark_dir_entry
+
+	; continue with next entry
+	jmp @next_entry
+
+; followup LFN entry
+@not_first_lfn_entry:
+
+	; compare checksum
+	ldy #13
+	lda (fat32_bufptr), y
+	cmp lfn_checksum
+	beq @checksum_ok
+	jmp @next_entry_clear_lfn_buffer
+
+@checksum_ok:
+	dec lfn_index
+
+	; add entry to buffer
+	jsr add_lfn_entry
+
+	; continue with next entry
+	jmp @next_entry
+
+
+;*******
+@short_entry:
+	; is there a LFN?
+	lda lfn_index
+	cmp #1
+	bne @is_short
+
+	; Compare checksum
+	lda #0
+	tay
+@checksum_loop:
+	tax
+	lsr
+	txa
+	ror
+	clc
+	adc (fat32_bufptr), y
+	iny
+	cpy #11
+	bne @checksum_loop
+
+	cmp lfn_checksum
+	bne @is_short
+
+	lda lfn_count
+	sta lfn_index
+
+	ldx #0
+@decode_lfn_loop:
+	sub16_val fat32_lfn_bufptr, fat32_lfn_bufptr, 32
+
+	ldy #1
+	lda #5
+	jsr decode_lfn_chars
+	bcc @name_done2
+	ldy #14
+	lda #6
+	jsr decode_lfn_chars
+	bcc @name_done2
+	ldy #28
+	lda #2
+	jsr decode_lfn_chars
+	dec lfn_index
+	bne @decode_lfn_loop
+@name_done2:
+	bra @name_done ; yes, we need to zero terminate!
+
+@is_short:
+	; Volume label decoding
+	bit tmp_dirent_flag
+	bmi @4b
+	jsr decode_volume_label
+	bra @name_done_z
+
+@4b:	; get upper/lower case flags
+	ldy #12
+	lda (fat32_bufptr), y
+	asl
+	asl
+	asl ; bits 7 and 6
+	sta tmp_sfn_case
+
 	; Copy first part of file name
 	ldy #0
 @4:	lda (fat32_bufptr), y
 	cmp #' '
 	beq @skip_spaces
+	bit tmp_sfn_case
+	bvc @ucase1
+	jsr to_lower
+@ucase1:
+	jsr filename_cp437_to_internal
 	sta fat32_dirent + dirent::name, y
 	iny
 	cpy #8
@@ -1303,6 +1691,13 @@ fat32_read_dirent:
 @7:	lda (fat32_bufptr), y
 	cmp #' '
 	beq @name_done
+	bit tmp_sfn_case
+	bpl @ucase2
+	jsr to_lower
+@ucase2:
+	phx
+	jsr filename_cp437_to_internal
+	plx
 	sta fat32_dirent + dirent::name, x
 	iny
 	inx
@@ -1311,9 +1706,9 @@ fat32_read_dirent:
 
 @name_done:
 	; Add zero-termination to output
-	lda #0
-	sta fat32_dirent + dirent::name, x
+	stz fat32_dirent + dirent::name, x
 
+@name_done_z:
 	; Copy file size
 	ldy #28
 	ldx #0
@@ -1327,16 +1722,16 @@ fat32_read_dirent:
 	; Copy cluster
 	ldy #26
 	lda (fat32_bufptr), y
-	sta fat32_dirent + dirent::cluster + 0
+	sta fat32_dirent + dirent::start + 0
 	iny
 	lda (fat32_bufptr), y
-	sta fat32_dirent + dirent::cluster + 1
+	sta fat32_dirent + dirent::start + 1
 	ldy #20
 	lda (fat32_bufptr), y
-	sta fat32_dirent + dirent::cluster + 2
+	sta fat32_dirent + dirent::start + 2
 	iny
 	lda (fat32_bufptr), y
-	sta fat32_dirent + dirent::cluster + 3
+	sta fat32_dirent + dirent::start + 3
 
 	; Save lba + fat32_bufptr
 	set32 cur_context + context::dirent_lba,    cur_context + context::lba
@@ -1348,10 +1743,241 @@ fat32_read_dirent:
 	sec
 	rts
 
+@next_entry_clear_lfn_buffer:
+	stz lfn_index
+
 @next_entry:
 	add16_val fat32_bufptr, fat32_bufptr, 32
-	jmp fat32_read_dirent
+	jmp @fat32_read_dirent_loop
 
+;-----------------------------------------------------------------------------
+; decode_volume_label
+;-----------------------------------------------------------------------------
+decode_volume_label:
+	ldy #0
+@1:	lda (fat32_bufptr), y
+	jsr filename_cp437_to_internal
+	sta fat32_dirent + dirent::name, y
+	iny
+	cpy #11
+	bne @1
+	dey
+	lda #$20
+@2:	cmp fat32_dirent + dirent::name, y
+	bne @3
+	dey
+	bpl @2
+@3:	iny
+	lda #0
+	sta fat32_dirent + dirent::name, y
+	rts
+
+;-----------------------------------------------------------------------------
+; check_lfn_index
+;
+; * c=1: ok
+;-----------------------------------------------------------------------------
+check_lfn_index:
+	lda lfn_index
+	beq @expect_start
+
+	lda lfn_index
+	dec
+	cmp (fat32_bufptr)
+	beq @ok
+
+	stz lfn_index
+@expect_start:
+	lda (fat32_bufptr)
+	asl
+	asl ; bit #6 -> C
+	rts
+
+@ok:
+	sec
+	rts
+
+;-----------------------------------------------------------------------------
+; add_lfn_entry
+;-----------------------------------------------------------------------------
+add_lfn_entry:
+	ldy #31
+:	lda (fat32_bufptr), y
+	sta (fat32_lfn_bufptr), y
+	dey
+	bpl :-
+	add16_val fat32_lfn_bufptr, fat32_lfn_bufptr, 32
+	rts
+
+;-----------------------------------------------------------------------------
+; decode_lfn_chars
+;
+; Convert 16 bit UCS-2-encoded LFN characters to private 8 bit encoding.
+;
+; In:   a  number of characters
+;       x  target index (offset in fat32_dirent + dirent::name)
+;       y  source index (offset in (fat32_lfn_bufptr))
+; Out:  x  updated target index
+;       y  updated source index
+;       c  =0: terminating 0 character encountered
+;-----------------------------------------------------------------------------
+decode_lfn_chars:
+	stx lfn_name_index
+	sta lfn_char_count
+@loop:
+ 	lda (fat32_lfn_bufptr), y
+ 	iny
+ 	pha
+ 	pha
+ 	lda (fat32_lfn_bufptr), y
+	iny
+ 	plx
+ 	pha
+ 	jsr filename_char_ucs2_to_internal
+	ldx lfn_name_index
+	sta fat32_dirent + dirent::name, x
+	inc lfn_name_index
+ 	pla
+ 	plx
+ 	bne @cont
+ 	tax
+ 	beq @end
+@cont:
+	dec lfn_char_count
+	bne @loop
+	ldx lfn_name_index
+	sec
+	rts
+@end:	ldx lfn_name_index
+	clc
+	rts
+
+;-----------------------------------------------------------------------------
+; encode_lfn_chars
+;
+; Convert characters in private 8 bit encoding to 16 bit UCS-2 (LFN) encoding.
+;
+; In:   a  number of characters
+;       x  target index (offset in (fat32_lfn_bufptr))
+;       y  source index (offset in (fat32_ptr))
+; Out:  x  updated target index
+;       y  updated source index
+;       c  =0: terminating 0 character encountered
+;-----------------------------------------------------------------------------
+encode_lfn_chars:
+	sta lfn_char_count
+@loop:
+ 	lda (fat32_ptr), y
+ 	pha
+ 	phy
+
+ 	phx
+	jsr filename_char_internal_to_ucs2
+ 	ply
+	sta (fat32_lfn_bufptr), y
+	iny
+	txa
+	sta (fat32_lfn_bufptr), y
+	iny
+ 	phy
+ 	plx
+
+ 	ply
+	pla
+	beq @end
+	iny
+	dec lfn_char_count
+	bne @loop
+	sec
+	rts
+@end:	clc
+	rts
+
+;-----------------------------------------------------------------------------
+; create_lfn
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+create_lfn:
+	; validate that filename is legal
+	ldy name_offset
+@validate_loop:
+	lda (fat32_ptr), y
+	beq @validate_ok
+	jsr validate_char
+	iny
+	bcs @validate_loop
+	lda #ERRNO_ILLEGAL_FILENAME
+	jmp set_errno
+
+@validate_ok:
+	; init buffer
+	set16_val fat32_lfn_bufptr, lfn_buf
+
+	lda #1
+	sta lfn_index
+
+	ldy name_offset
+
+@create_lfn_loop:
+	phy
+
+	; create FLN template
+
+	; fill remainder bytes with $FF
+	ldy #31
+:	lda #$ff
+	sta (fat32_lfn_bufptr), y
+	dey
+	bne :-
+
+	; fill in special bytes
+	ldy #0
+	lda lfn_index
+	sta (fat32_lfn_bufptr), y
+	ldy #11
+	lda #$0f
+	sta (fat32_lfn_bufptr), y
+	iny
+	lda #0
+	sta (fat32_lfn_bufptr), y
+	; leave checksum at offset 13 empty for now
+	ldy #26
+	lda #0
+	sta (fat32_lfn_bufptr), y
+	iny
+	sta (fat32_lfn_bufptr), y
+
+	ply
+
+	; put 13 chars into entry
+	ldx #1
+	lda #5
+	jsr encode_lfn_chars
+	bcc @name_done
+	ldx #14
+	lda #6
+	jsr encode_lfn_chars
+	bcc @name_done
+	ldx #28
+	lda #2
+	jsr encode_lfn_chars
+	bcc @name_done
+
+	add16_val fat32_lfn_bufptr, fat32_lfn_bufptr, 32
+
+	inc lfn_index
+
+	bra @create_lfn_loop
+
+@name_done:
+	lda (fat32_lfn_bufptr)
+	sta lfn_count
+	ora #$40
+	sta (fat32_lfn_bufptr)
+
+	sec
+	rts
 
 ;-----------------------------------------------------------------------------
 ; fat32_read_dirent_filtered
@@ -1399,7 +2025,7 @@ fat32_chdir:
 
 @1:
 	; Set as current directory
-	set32 fat32_cwd_cluster, fat32_dirent + dirent::cluster
+	set32 cur_volume + fs::cwd_cluster, fat32_dirent + dirent::start
 
 	sec
 	rts
@@ -1434,10 +2060,6 @@ fat32_rename:
 	jmp set_errno
 
 @1:
-	; Convert target filename into directory entry format
-	jsr convert_filename
-	bcc @error
-
 	; Find file to rename
 	set16 fat32_ptr, tmp_buf
 	jsr find_dirent
@@ -1446,14 +2068,52 @@ fat32_rename:
 	jmp set_errno
 
 @3:
-	; Copy new filename into sector buffer
+	; rescue shortname entry
 	set16 fat32_bufptr, cur_context + context::dirent_bufptr
+
+	ldy #11
+@loop:	lda (fat32_bufptr), y
+	sta tmp_entry - 11, y
+	iny
+	cpy #32
+	bne @loop
+
+	; delete
+	sec ; ignore read-only bit
+	jsr delete_entry
+	bcs @4
+	rts
+@4:
+
+	; target name
+	set16 fat32_ptr, fat32_ptr2
+
+	; Find space
+	jsr find_space_for_lfn
+	bcc @error
+
+	; Create short name
+	jsr create_shortname
+	bcc @error
+
+	; Write LFN entries
+	jsr write_lfn_entries
+	bcc @error
+
+	; Copy new shortname into sector buffer
 	ldy #0
-@2:	lda filename_buf, y
+@2:	lda shortname_buf, y
 	sta (fat32_bufptr), y
 	iny
 	cpy #11
 	bne @2
+
+	; restore remainder of short name entry
+@5:	lda tmp_entry - 11, y
+	sta (fat32_bufptr), y
+	iny
+	cpy #32
+	bne @5
 
 	; Write sector buffer to disk
 	jmp save_sector_buffer
@@ -1531,12 +2191,17 @@ fat32_rmdir:
 	; Find directory
 	jsr find_dir
 	bcs @2
+@fnf:
 	lda #ERRNO_FILE_NOT_FOUND
 	jmp set_errno
 
 @2:
+	; make sure user isn't trying to remove '.' or '..' entries
+	jsr check_dot_or_dotdot
+	bcs @fnf
+
 	; Open directory
-	set32 cur_context + context::cluster, fat32_dirent + dirent::cluster
+	set32 cur_context + context::cluster, fat32_dirent + dirent::start
 	jsr open_cluster
 	bcc @error
 
@@ -1548,9 +2213,9 @@ fat32_rmdir:
 	clc
 	rts
 
-@3:	lda fat32_dirent + dirent::name
-	cmp #'.'	; Allow for dot-entries
-	beq @next
+@3:	; Allow for '.' and '..' entries
+	jsr check_dot_or_dotdot
+	bcs @next
 	lda #ERRNO_DIR_NOT_EMPTY
 	jmp set_errno
 
@@ -1559,18 +2224,30 @@ fat32_rmdir:
 	jsr find_dir
 	bcc @error
 
-	; Mark file as deleted
-	set16 fat32_bufptr, cur_context + context::dirent_bufptr
-	lda #$E5
-	sta (fat32_bufptr)
+	clc ; respect read-only bit
+	jsr delete_entry
+	bcs @4
+	rts
 
-	; Write sector buffer to disk
-	jsr save_sector_buffer
-	bcc @error
-
+@4:
 	; Unlink cluster chain
-	set32 cur_context + context::cluster, fat32_dirent + dirent::cluster
+	set32 cur_context + context::cluster, fat32_dirent + dirent::start
 	jmp unlink_cluster_chain
+
+check_dot_or_dotdot:
+	lda fat32_dirent + dirent::name
+	cmp #'.'
+	bne @no
+	lda fat32_dirent + dirent::name + 1
+	beq @yes
+	cmp #'.'
+	bne @no
+	lda fat32_dirent + dirent::name + 2
+	beq @yes
+@no:	clc
+	rts
+@yes:	sec
+	rts
 
 ;-----------------------------------------------------------------------------
 ; fat32_open
@@ -1596,7 +2273,7 @@ fat32_open:
 	; Open file
 	set32_val cur_context + context::file_offset, 0
 	set32 cur_context + context::file_size, fat32_dirent + dirent::size
-	set32 cur_context + context::cluster, fat32_dirent + dirent::cluster
+	set32 cur_context + context::cluster, fat32_dirent + dirent::start
 	jsr open_cluster
 	bcc @error
 
@@ -1612,18 +2289,16 @@ fat32_open:
 	rts
 
 ;-----------------------------------------------------------------------------
-; create_dir_entry
-;
-; A: File attribute
+; find_space_for_lfn
 ;
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
-create_dir_entry:
-	sta tmp_buf
-
-	; Convert file name
-	jsr convert_filename
+find_space_for_lfn:
+	; Create LFN
+	jsr create_lfn
 	bcc @error
+
+	stz free_entry_count
 
 	; Find free directory entry
 	set32 cur_context + context::cluster, tmp_dir_cluster
@@ -1645,22 +2320,177 @@ create_dir_entry:
 	cmp #$E5
 	beq @free_entry
 
+	stz free_entry_count
+
+@try_next:
 	; Increment buffer pointer to next entry
 	add16_val fat32_bufptr, fat32_bufptr, 32
 	bra @next_entry
 
 	; Free directory entry found
 @free_entry:
-	; Copy filename in new entry
+	lda free_entry_count
+	bne @not_first_free_entry
+
+	; remember where the first free one was
+	jsr mark_dir_entry
+
+@not_first_free_entry:
+	lda free_entry_count
+	inc free_entry_count
+	cmp lfn_count
+	bne @try_next ; not reached lfn_count+1 yet
+
+	; enough consecutive entries found
+	; -> set pointer to first free entry
+	jmp rewind_dir_entry
+
+;-----------------------------------------------------------------------------
+; mark_dir_entry
+;
+; Save current cluster, LBA and directory entry index.
+;-----------------------------------------------------------------------------
+mark_dir_entry:
+	; save cluster
+	lda cur_context + context::cluster + 0
+	sta marked_entry_cluster + 0
+	lda cur_context + context::cluster + 1
+	sta marked_entry_cluster + 1
+	lda cur_context + context::cluster + 2
+	sta marked_entry_cluster + 2
+	lda cur_context + context::cluster + 3
+	sta marked_entry_cluster + 3
+	; save LBA
+	lda cur_context + context::lba + 0
+	sta marked_entry_lba + 0
+	lda cur_context + context::lba + 1
+	sta marked_entry_lba + 1
+	lda cur_context + context::lba + 2
+	sta marked_entry_lba + 2
+	lda cur_context + context::lba + 3
+	sta marked_entry_lba + 3
+	; save offset
+	lda fat32_bufptr + 0
+	sta marked_entry_offset + 0
+	lda fat32_bufptr + 1
+	sta marked_entry_offset + 1
+	rts
+
+;-----------------------------------------------------------------------------
+; rewind_dir_entry
+;
+; Restore cluster, LBA and directory entry index.
+;-----------------------------------------------------------------------------
+rewind_dir_entry:
+	; restore cluster
+	lda marked_entry_cluster + 0
+	sta cur_context + context::cluster + 0
+	lda marked_entry_cluster + 1
+	sta cur_context + context::cluster + 1
+	lda marked_entry_cluster + 2
+	sta cur_context + context::cluster + 2
+	lda marked_entry_cluster + 3
+	sta cur_context + context::cluster + 3
+	; restore LBA
+	lda marked_entry_lba + 0
+	sta cur_context + context::lba + 0
+	lda marked_entry_lba + 1
+	sta cur_context + context::lba + 1
+	lda marked_entry_lba + 2
+	sta cur_context + context::lba + 2
+	lda marked_entry_lba + 3
+	sta cur_context + context::lba + 3
+	; restore entry
+	lda marked_entry_offset + 0
+	sta fat32_bufptr + 0
+	lda marked_entry_offset + 1
+	sta fat32_bufptr + 1
+
+	; load
+	jmp load_sector_buffer
+
+;-----------------------------------------------------------------------------
+; write_lfn_entries
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+write_lfn_entries:
+	dec lfn_count
+	bpl @1
+	sec
+	rts
+
+@1:
+	; Copy LFN entry
+	ldy #31
+@2b:	lda (fat32_lfn_bufptr), y
+	sta (fat32_bufptr), y
+	dey
+	bpl @2b
+
+	; set checksum
+	ldy #13
+	lda lfn_checksum
+	sta (fat32_bufptr), y
+
+	jsr save_sector_buffer
+	bcs @ok
+@error:
+	clc
+	rts
+
+@ok:
+	add16_val fat32_bufptr, fat32_bufptr, 32
+	sub16_val fat32_lfn_bufptr, fat32_lfn_bufptr, 32
+
+	cmp16_val_ne fat32_bufptr, sector_buffer_end, @1b
+	lda #0
+	jsr next_sector
+	bcc @error
+@1b:
+	bra write_lfn_entries
+
+@write_lfn_entries_end:
+	rts
+
+;-----------------------------------------------------------------------------
+; create_dir_entry
+;
+; A: File attribute
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+create_dir_entry:
+	sta tmp_attrib
+
+	; Find space
+	jsr find_space_for_lfn
+	bcs @1
+@error:
+	clc
+	rts
+
+@1:
+	; Create short name
+	jsr create_shortname
+	bcc @error
+
+	; Write LFN entries
+	jsr write_lfn_entries
+	bcc @error
+
+	; Write short name entry
+
+	; Copy shortname in new entry
 	ldy #0
-@2:	lda filename_buf, y
+@2:	lda shortname_buf, y
 	sta (fat32_bufptr), y
 	iny
 	cpy #11
 	bne @2
 
 	; File attribute
-	lda tmp_buf
+	lda tmp_attrib
 	sta (fat32_bufptr), y
 	iny
 
@@ -1692,27 +2522,39 @@ create_dir_entry:
 ;-----------------------------------------------------------------------------
 ; fat32_create
 ;
-; Create file. Delete it if it already exists.
+; Create file.
+;
+; c=1: Delete it if it already exists.
 ;-----------------------------------------------------------------------------
 fat32_create:
+	php ; overwrite flag
 	stz fat32_errno
 
 	; Check if context is free
 	lda cur_context + context::flags
 	beq @1
+	plp ; overwrite flag
 @error:	clc
 	rts
 @1:
 	; Check if directory entry already exists?
 	jsr find_dirent
 	bcs @exists
+	plp ; overwrite flag
 	lda fat32_errno
 	bne @error
 	bra @ok
 
 @exists:
+	plp ; overwrite flag
+	bcs @overwrite
+
+	lda #ERRNO_FILE_EXISTS
+	jmp set_errno
+
+@overwrite:
 	; Delete file first if it exists
-	jsr delete_file
+	jsr delete_file2
 	bcc @error
 
 @ok:	; Create directory entry
@@ -1772,13 +2614,13 @@ fat32_mkdir:
 	sta sector_buffer + 11
 	sta sector_buffer + 32 + 11
 
-	lda free_cluster + 0
+	lda cur_volume + fs::free_cluster + 0
 	sta sector_buffer + 26
-	lda free_cluster + 1
+	lda cur_volume + fs::free_cluster + 1
 	sta sector_buffer + 27
-	lda free_cluster + 2
+	lda cur_volume + fs::free_cluster + 2
 	sta sector_buffer + 20
-	lda free_cluster + 3
+	lda cur_volume + fs::free_cluster + 3
 	sta sector_buffer + 21
 
 	lda tmp_dir_cluster + 0
@@ -2015,16 +2857,16 @@ allocate_first_cluster:
 
 	; Write cluster number to directory entry
 	ldy #26
-	lda free_cluster + 0
+	lda cur_volume + fs::free_cluster + 0
 	sta (fat32_bufptr), y
 	iny
-	lda free_cluster + 1
+	lda cur_volume + fs::free_cluster + 1
 	sta (fat32_bufptr), y
 	ldy #20
-	lda free_cluster + 2
+	lda cur_volume + fs::free_cluster + 2
 	sta (fat32_bufptr), y
 	iny
-	lda free_cluster + 3
+	lda cur_volume + fs::free_cluster + 3
 	sta (fat32_bufptr), y
 
 	; Write directory sector
@@ -2032,7 +2874,7 @@ allocate_first_cluster:
 	bcc @error
 
 	; Set allocated cluster as current
-	set32 cur_context + context::cluster, free_cluster
+	set32 cur_context + context::cluster, cur_volume + fs::free_cluster
 	sec
 	rts
 
@@ -2203,9 +3045,9 @@ fat32_write:
 ; fat32_get_free_space
 ;-----------------------------------------------------------------------------
 fat32_get_free_space:
-	set32 fat32_size, free_clusters
+	set32 fat32_size, cur_volume + fs::free_clusters
 
-	lda cluster_shift
+	lda cur_volume + fs::cluster_shift
 	cmp #0	; 512B cluster
 	beq @512b
 
@@ -2246,5 +3088,203 @@ fat32_next_sector:
 ;-----------------------------------------------------------------------------
 fat32_get_offset:
 	set32 fat32_size, cur_context + context::file_offset
+	sec
+	rts
+
+;-----------------------------------------------------------------------------
+; fat32_get_vollabel
+;
+; Get the "volume label", i.e. the name of the filesystem.
+;
+; Out: fat32_dirent::name  name
+;
+; * If a directory volume label exists, it will be returned.
+; * Otherwise, the boot sector volume label will be returned.
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+fat32_get_vollabel:
+	stz fat32_errno
+
+	; Check if context is free
+	lda cur_context + context::flags
+	bne @error
+
+	; Get directory volume label
+	jsr open_rootdir
+	bcc @error
+	clc
+	jsr read_dirent
+	bcc @no_dir_vollabel
+
+	sec
+	rts
+
+	; Fall back to boot sector volume label
+@no_dir_vollabel:
+	; Read first sector of partition
+	set32 cur_context + context::lba, cur_volume + fs::lba_partition
+	jsr load_sector_buffer
+	bcc @error
+
+	set16_val fat32_bufptr, (sector_buffer + $47)
+	jsr decode_volume_label
+	sec
+	rts
+
+@error:	clc
+	rts
+
+;-----------------------------------------------------------------------------
+; fat32_set_vollabel
+;
+; Set the "volume label", i.e. the name of the filesystem.
+;
+; In:  fat32_ptr  name
+;
+; * The string can be up to 11 characters; extra characters will be ignored.
+; * Allowed characters:
+;   - Context: Windows and Mac encode it as CP437 on disk, Mac does not allow
+;     non-ASCII characters, Windows does, but converts them to uppercase.
+;   - This function allows all CP437-encodable characters, without a case
+;     change.
+;   - Non-encodable characters will cause an error.
+; * The volume label will always be written into the boot sector. If a
+;   directory volume label exists, it will be removed.
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+fat32_set_vollabel:
+	stz fat32_errno
+
+	; Check if context is free
+	lda cur_context + context::flags
+	bne @error
+
+	; Get directory volume label
+	jsr open_rootdir
+	bcc @error
+	clc
+	jsr read_dirent
+	bcc @no_dir_vollabel
+
+	sec ; ignore read-only bit
+	jsr delete_entry
+	bcc @error
+
+@no_dir_vollabel:
+	; Read first sector of partition
+	set32 cur_context + context::lba, cur_volume + fs::lba_partition
+	jsr load_sector_buffer
+	bcc @error
+
+	ldy #0
+@1:	lda (fat32_ptr), y
+	beq @2
+	jsr filename_char_internal_to_cp437
+	beq @fn_error
+	sta sector_buffer + $47, y
+	iny
+	cpy #11
+	bne @1
+
+	; pad with spaces
+@2:	cpy #11
+	beq @3
+	lda #$20
+	sta sector_buffer + $47, y
+	iny
+	bra @2
+
+@3:	jmp save_sector_buffer
+
+@fn_error:
+	lda #ERRNO_ILLEGAL_FILENAME
+	jmp set_errno
+
+@error:	clc
+	rts
+
+;-----------------------------------------------------------------------------
+; load_mbr_sector
+;
+; Read partition table (sector 0)
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+load_mbr_sector:
+	set32_val cur_context + context::lba, 0
+	jmp load_sector_buffer
+
+;-----------------------------------------------------------------------------
+; fat32_get_ptable_entry
+;
+; Returns a given partition table entry
+;
+; In:  a  index
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+fat32_get_ptable_entry:
+	stz fat32_errno
+
+	cmp #$4
+	bcs @error ; end of list
+
+	asl
+	asl
+	asl
+	asl
+	pha
+
+	jsr load_mbr_sector
+	plx
+	bcs @1
+@error:	clc
+	rts
+
+@1:	; start LBA
+	phx
+	ldy #0
+@2:	lda sector_buffer + $1BE + 8, x
+	sta fat32_dirent + dirent::start, y
+	inx
+	iny
+	cpy #4
+	bne @2
+	plx
+
+	; size
+	phx
+	ldy #0
+@3:	lda sector_buffer + $1BE + 12, x
+	sta fat32_dirent + dirent::size, y
+	inx
+	iny
+	cpy #4
+	bne @3
+	plx
+
+	; type
+	lda sector_buffer + $1BE + 4, x
+	sta fat32_dirent + dirent::attributes
+
+	stz fat32_dirent + dirent::name
+
+	cmp #$0b
+	beq @read_name
+	cmp #$0c
+	bne @done
+
+@read_name:
+	; Read first sector of partition
+	set32 cur_context + context::lba, fat32_dirent + dirent::start
+	jsr load_sector_buffer
+	bcc @error
+
+	set16_val fat32_bufptr, (sector_buffer + $47)
+	jsr decode_volume_label
+
+@done:
 	sec
 	rts
