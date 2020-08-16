@@ -5,7 +5,6 @@
 ;
 ; TODO:
 ; - implement fat32_seek
-; - implement timestamps
 ;-----------------------------------------------------------------------------
 
 	.include "fat32.inc"
@@ -20,7 +19,7 @@
 	.import match_name, match_type
 
 	; mkfs.s
-	.export load_mbr_sector, write_sector, clear_buffer, set_errno
+	.export load_mbr_sector, write_sector, clear_buffer, set_errno, unmount
 
 
 FLAG_IN_USE = 1<<0  ; Context in use
@@ -36,7 +35,8 @@ bufptr          .word    ; Pointer within sector_buffer
 file_size       .dword   ; Size of current file
 file_offset     .dword   ; Offset in current file
 dirent_lba      .dword   ; Sector containing directory entry for this file
-dirent_bufptr   .word    ; Offset to start of directory entry 
+dirent_bufptr   .word    ; Offset to start of directory entry
+eof             .byte    ; =$ff: EOF has been reached
 .endstruct
 
 CONTEXT_SIZE = 32
@@ -80,6 +80,13 @@ FS_SIZE      = 64
 	.bss
 _fat32_bss_start:
 
+fat32_time_year:     .byte 0
+fat32_time_month:    .byte 0
+fat32_time_day:      .byte 0
+fat32_time_hours:    .byte 0
+fat32_time_minutes:  .byte 0
+fat32_time_seconds:  .byte 0
+
 ; Temp
 bytecnt:             .word 0       ; Used by fat32_write
 tmp_buf:             .res 4        ; Used by save_sector_buffer, fat32_rename
@@ -91,6 +98,8 @@ tmp_dir_cluster:     .dword 0
 tmp_attrib:          .byte 0       ; temporary: attribute when creating a dir entry
 tmp_dirent_flag:     .byte 0
 shortname_buf:       .res 11       ; Used for shortname creation
+tmp_timestamp:       .byte 0
+tmp_filetype:        .byte 0       ; Used to match file type in find_dirent
 
 ; Temp - LFN
 lfn_index:           .byte 0       ; counter when collecting/decoding LFN entries
@@ -139,14 +148,18 @@ _fat32_bss_end:
 ;-----------------------------------------------------------------------------
 ; set_volume
 ;
-; In:  a volume
+; In:  a  volume
+;      c  =1: don't mount
 ;
 ; * c=0: failure
 ;-----------------------------------------------------------------------------
 set_volume:
+	php ; mount flag
+
 	; Already selected?
 	cmp volume_idx
 	bne @0
+	plp
 	sec
 	rts
 
@@ -155,6 +168,7 @@ set_volume:
 	cmp #FAT32_VOLUMES
 	bcc @ok
 
+	plp
 	lda #ERRNO_NO_FS
 	jmp set_errno
 
@@ -207,10 +221,13 @@ set_volume:
 .endif
 
 	sta volume_idx
+
+	plp
+	bcs @done ; don't mount
 	bit cur_volume + fs::mounted
 	bmi @done
 	lda volume_idx
-	jmp fat32_mount
+	jmp mount
 @done:
 	sec
 	rts
@@ -605,6 +622,7 @@ fat32_alloc_context:
 	cmp #$ff
 	sec
 	beq @2
+	clc
 	jsr set_volume
 @2:	pla
 	bcs @rts
@@ -944,9 +962,14 @@ next_sector:
 ;
 ; Find directory entry with path specified in string pointed to by fat32_ptr
 ;
+; In:  a  =$00 allow files and directories
+;         =$80 only allow files
+;         =$40 only allow directories
+;
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
 find_dirent:
+	sta tmp_filetype
 	stz name_offset
 
 	; If path starts with a slash, use root directory as base,
@@ -968,8 +991,9 @@ find_dirent:
 	stz fat32_dirent + dirent::name + 1
 	lda #$10
 	sta fat32_dirent + dirent::attributes
+	.assert dirent::start < dirent::size, error ; must be next to each other
 	ldx #0
-@clr:	stz fat32_dirent + dirent::size, x
+@clr:	stz fat32_dirent + dirent::start, x
 	inx
 	cpx #8
 	bne @clr
@@ -999,7 +1023,16 @@ find_dirent:
 	beq @chdir
 
 	lda fat32_dirent + dirent::attributes
-	jsr match_type
+	bit #$10
+	bne @is_dir
+	; is file
+	bit tmp_filetype
+	bvs @next
+	bra @ok
+@is_dir:
+	bit tmp_filetype
+	bmi @next
+@ok:	jsr match_type
 	bcc @next
 
 @found:	; Found
@@ -1032,21 +1065,8 @@ find_dirent:
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
 find_file:
-	; Find directory entry
-	jsr find_dirent
-	bcc @error
-
-	; Check if this is a file
-	lda fat32_dirent + dirent::attributes
-	bit #$10
-	bne @error
-
-	; Success
-	sec
-	rts
-
-@error:	clc
-	rts
+	lda #$80 ; files only
+	jmp find_dirent
 
 ;-----------------------------------------------------------------------------
 ; find_dir
@@ -1056,21 +1076,8 @@ find_file:
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
 find_dir:
-	; Find directory entry
-	jsr find_dirent
-	bcc @error
-
-	; Check if this is a directory
-	lda fat32_dirent + dirent::attributes
-	bit #$10
-	beq @error
-
-	; Success
-	sec
-	rts
-
-@error:	clc
-	rts
+	lda #$40 ; directories only
+	jmp find_dirent
 
 ;-----------------------------------------------------------------------------
 ; delete_entry
@@ -1170,13 +1177,6 @@ fat32_init:
 	cpx #>_fat32_bss_end
 	bne @1
 
-	; Initialize SD card
-	jsr sdcard_init
-	bcs @0
-	lda #ERRNO_NO_MEDIA
-	jmp set_errno
-@0:
-
 	; Make sure sector_lba is non-zero
 	; (was overwritten by sdcard_init)
 	lda #$FF
@@ -1185,17 +1185,20 @@ fat32_init:
 	; No current volume
 	sta volume_idx
 
+	; No time set up
+	sta fat32_time_year
+
 	sec
 	rts
 
 ;-----------------------------------------------------------------------------
-; fat32_mount
+; mount
 ;
 ; In:  a  partition number (0+)
 ;
 ; * c=0: failure; sets errno
 ;-----------------------------------------------------------------------------
-fat32_mount:
+mount:
 	pha ; partition number
 
 	jsr load_mbr_sector
@@ -1309,6 +1312,23 @@ fat32_mount:
 	rts
 
 ;-----------------------------------------------------------------------------
+; unmount
+;
+; In:  a  partition number (0+)
+;
+; * c=0: failure; sets errno
+;-----------------------------------------------------------------------------
+unmount:
+	sec ; don't mount
+	jsr set_volume
+	; Set unmounted
+	stz cur_volume + fs::mounted
+	; No current volume
+	lda #$ff
+	sta volume_idx
+	rts
+
+;-----------------------------------------------------------------------------
 ; fat32_set_context
 ;
 ; context index in A
@@ -1382,6 +1402,7 @@ fat32_set_context:
 	lda volume_for_context, x
 	cmp #$ff
 	beq @no_volume
+	clc
 	jsr set_volume
 	bcc @error
 
@@ -1456,10 +1477,12 @@ fat32_open_dir:
 
 ;-----------------------------------------------------------------------------
 ; fat32_find_dirent
+;
+; same args as find_dirent
 ;-----------------------------------------------------------------------------
 fat32_find_dirent:
 	; Check if context is free
-	lda cur_context + context::flags
+	ldx cur_context + context::flags
 	bne @error
 
 	; Open current directory
@@ -1656,7 +1679,12 @@ read_dirent:
 @4:	lda (fat32_bufptr), y
 	cmp #' '
 	beq @skip_spaces
-	bit tmp_sfn_case
+	cmp #$05 ; $05 at first character translates into $E5
+	bne @n05
+	cpy #0
+	bne @n05
+	lda #$E5
+@n05:	bit tmp_sfn_case
 	bvc @ucase1
 	jsr to_lower
 @ucase1:
@@ -1709,6 +1737,63 @@ read_dirent:
 	stz fat32_dirent + dirent::name, x
 
 @name_done_z:
+	; Decode mtime timestamp
+	ldy #$16
+	lda (fat32_bufptr), y
+	iny
+	ora (fat32_bufptr), y
+	iny
+	ora (fat32_bufptr), y
+	iny
+	ora (fat32_bufptr), y
+	bne @ts1
+	stz fat32_dirent + dirent::mtime_seconds
+	stz fat32_dirent + dirent::mtime_minutes
+	stz fat32_dirent + dirent::mtime_hours
+	stz fat32_dirent + dirent::mtime_day
+	lda #$ff ; year 2235 signals "no date"
+	bra @ts2
+@ts1:	ldy #$16
+	lda (fat32_bufptr), y
+	sta tmp_timestamp
+	and #31
+	asl
+	sta fat32_dirent + dirent::mtime_seconds
+	iny
+	lda (fat32_bufptr), y
+	asl tmp_timestamp
+	rol
+	asl tmp_timestamp
+	rol
+	asl tmp_timestamp
+	rol
+	and #63
+	sta fat32_dirent + dirent::mtime_minutes
+	lda (fat32_bufptr), y
+	lsr
+	lsr
+	lsr
+	sta fat32_dirent + dirent::mtime_hours
+	iny
+	lda (fat32_bufptr), y
+	tax
+	and #31
+	sta fat32_dirent + dirent::mtime_day
+	iny
+	lda (fat32_bufptr), y
+	sta tmp_timestamp
+	txa
+	lsr tmp_timestamp
+	ror
+	lsr
+	lsr
+	lsr
+	lsr
+	sta fat32_dirent + dirent::mtime_month
+	lda (fat32_bufptr), y
+	lsr
+@ts2:	sta fat32_dirent + dirent::mtime_year
+
 	; Copy file size
 	ldy #28
 	ldx #0
@@ -2053,6 +2138,7 @@ fat32_rename:
 
 	; Make sure target name doesn't exist
 	set16 fat32_ptr, fat32_ptr2
+	lda #0 ; allow files and directories
 	jsr find_dirent
 	bcc @1
 	; Error, file exists
@@ -2062,6 +2148,7 @@ fat32_rename:
 @1:
 	; Find file to rename
 	set16 fat32_ptr, tmp_buf
+	lda #0 ; allow files and directories
 	jsr find_dirent
 	bcs @3
 	lda #ERRNO_FILE_NOT_FOUND
@@ -2139,6 +2226,7 @@ fat32_set_attribute:
 
 @0:
 	; Find file
+	lda #0 ; allow files and directories
 	jsr find_dirent
 	bcs @3
 	lda #ERRNO_FILE_NOT_FOUND
@@ -2271,6 +2359,7 @@ fat32_open:
 
 @1:
 	; Open file
+	stz cur_context + context::eof
 	set32_val cur_context + context::file_offset, 0
 	set32 cur_context + context::file_size, fat32_dirent + dirent::size
 	set32 cur_context + context::cluster, fat32_dirent + dirent::start
@@ -2538,6 +2627,7 @@ fat32_create:
 	rts
 @1:
 	; Check if directory entry already exists?
+	lda #0 ; allow files and directories
 	jsr find_dirent
 	bcs @exists
 	plp ; overwrite flag
@@ -2574,6 +2664,7 @@ fat32_mkdir:
 	bne @error
 
 	; Check if directory doesn't exist yet
+	lda #0 ; allow files and directories
 	jsr find_dirent
 	bcc @0
 	lda #ERRNO_FILE_EXISTS
@@ -2650,24 +2741,28 @@ fat32_close:
 	stz fat32_errno
 
 	lda cur_context + context::flags
-	beq @done
-
+	bne :+
+	jmp @done
+:
 	; Write current sector if dirty
 	jsr sync_sector_buffer
-	bcc error_clear_context
-
-	; Update directory entry with new size if needed
+	bcs :+
+	jmp error_clear_context
+:
+	; Update directory entry with new size and mdate if needed
 	lda cur_context + context::flags
 	bit #FLAG_DIRENT
-	beq @done
-	and #(FLAG_DIRENT ^ $FF)	; Clear bit
+	bne :+
+	jmp @done
+:	and #(FLAG_DIRENT ^ $FF)	; Clear bit
 	sta cur_context + context::flags
 
 	; Load sector of directory entry
 	set32 cur_context + context::lba, cur_context + context::dirent_lba
 	jsr load_sector_buffer
-	bcc error_clear_context
-
+	bcs :+
+	jmp error_clear_context
+:
 	; Write size to directory entry
 	set16 fat32_bufptr, cur_context + context::dirent_bufptr
 	ldy #28
@@ -2682,6 +2777,97 @@ fat32_close:
 	iny
 	lda cur_context + context::file_size + 3
 	sta (fat32_bufptr), y
+
+	; Encode mtime timestamp
+@ts1:	lda fat32_time_year
+	inc
+	bne @ts3
+	; no time set up
+	lda #0
+	ldy #$16
+	sta (fat32_bufptr), y
+	iny
+	sta (fat32_bufptr), y
+	iny
+	sta (fat32_bufptr), y
+	iny
+	sta (fat32_bufptr), y
+	bra @ts2
+
+@ts3:	ldy #$16
+	lda fat32_time_minutes
+	tax
+	asl
+	asl
+	asl
+	asl
+	asl
+	sta (fat32_bufptr), y
+	lda fat32_time_seconds
+	lsr
+	ora (fat32_bufptr), y
+	sta (fat32_bufptr), y
+	iny
+	txa
+	lsr
+	lsr
+	lsr
+	sta (fat32_bufptr), y
+	lda fat32_time_hours
+	asl
+	asl
+	asl
+	ora (fat32_bufptr), y
+	sta (fat32_bufptr), y
+	iny
+	lda fat32_time_month
+	tax
+	asl
+	asl
+	asl
+	asl
+	asl
+	ora fat32_time_day
+	sta (fat32_bufptr), y
+	iny
+	txa
+	lsr
+	lsr
+	lsr
+	sta (fat32_bufptr), y
+	lda fat32_time_year
+	asl
+	ora (fat32_bufptr), y
+	sta (fat32_bufptr), y
+@ts2:
+
+	; Fill creation date if empty
+	ldy #$0e
+	lda (fat32_bufptr), y
+	iny
+	ora (fat32_bufptr), y
+	iny
+	ora (fat32_bufptr), y
+	iny
+	ora (fat32_bufptr), y
+	bne @ts4
+	ldy #$16
+	lda (fat32_bufptr), y
+	ldy #$0e
+	sta (fat32_bufptr), y
+	ldy #$17
+	lda (fat32_bufptr), y
+	ldy #$0f
+	sta (fat32_bufptr), y
+	ldy #$18
+	lda (fat32_bufptr), y
+	ldy #$10
+	sta (fat32_bufptr), y
+	ldy #$19
+	lda (fat32_bufptr), y
+	ldy #$11
+	sta (fat32_bufptr), y
+@ts4:
 
 	; Write directory sector
 	jsr save_sector_buffer
@@ -2706,30 +2892,42 @@ error_clear_context:
 ;-----------------------------------------------------------------------------
 ; fat32_read_byte
 ;
-; * c=0: failure; sets errno
+; Out:  a      byte
+;       x      =$ff: EOF after this byte
+;       c      =0: success
+;              =1: failure (includes reading past EOF)
+;       errno  =0: no error, or reading past EOF
+;              =ERRNO_READ: read error
 ;-----------------------------------------------------------------------------
 fat32_read_byte:
 	stz fat32_errno
 
 	; Bytes remaining?
-	cmp32_ne cur_context + context::file_offset, cur_context + context::file_size, @1
-@error:	clc
-	rts
-@1:
+	bit cur_context + context::eof
+	bmi @error
+
 	; At end of buffer?
 	cmp16_val_ne fat32_bufptr, sector_buffer_end, @2
 	lda #0
 	jsr next_sector
 	bcc @error
 @2:
-	; Decrement bytes remaining
+	; Increment offset within file
 	inc32 cur_context + context::file_offset
 
+	ldx #0   ; no EOF
+	cmp32_ne cur_context + context::file_offset, cur_context + context::file_size, @3
+	ldx #$ff ; EOF
+	stx cur_context + context::eof
+@3:
 	; Get byte from buffer
 	lda (fat32_bufptr)
 	inc16 fat32_bufptr
 
 	sec	; Indicate success
+	rts
+
+@error:	clc
 	rts
 
 ;-----------------------------------------------------------------------------
@@ -2811,12 +3009,15 @@ fat32_read:
 	set16 bytecnt, tmp_buf
 @5:
 	; Copy bytecnt bytes from buffer
-	ldy #0
+	ldy bytecnt
+	dey
+	beq @6b
 @6:	lda (fat32_bufptr), y
 	sta (fat32_ptr), y
-	iny
-	cpy bytecnt
+	dey
 	bne @6
+@6b:	lda (fat32_bufptr), y
+	sta (fat32_ptr), y
 
 	; fat32_ptr += bytecnt, fat32_bufptr += bytecnt, fat32_size -= bytecnt, file_offset += bytecnt
 	add16 fat32_ptr, fat32_ptr, bytecnt
@@ -3001,12 +3202,15 @@ fat32_write:
 	sta bytecnt + 1
 @3:
 	; Copy bytecnt bytes into buffer
-	ldy #0
+	ldy bytecnt
+	dey
+	beq @4b
 @4:	lda (fat32_ptr), y
 	sta (fat32_bufptr), y
-	iny
-	cpy bytecnt
+	dey
 	bne @4
+@4b:	lda (fat32_ptr), y
+	sta (fat32_bufptr), y
 
 	; fat32_ptr += bytecnt, fat32_bufptr += bytecnt, fat32_size -= bytecnt, file_offset += bytecnt
 	add16 fat32_ptr, fat32_ptr, bytecnt

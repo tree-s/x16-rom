@@ -6,6 +6,7 @@
 .include "banks.inc"
 
 .import jsrfar
+.import clock_get_date_time
 
 .import cbdos_secnd
 .import cbdos_tksa
@@ -25,6 +26,7 @@
 .import serial_listn
 .import serial_talk
 
+.export ieeeswitch_init
 .export secnd
 .export tksa
 .export acptr
@@ -33,111 +35,164 @@
 .export unlsn
 .export listn
 .export talk
+.export macptr
 
 .segment "KVAR"
 
-cbdos_enabled:
-	.res 1
+cbdos_flags:   ; bit  6:   =1: CBDOS is talker
+	.res 1 ; bit  7:   =1: CBDOS is listener
 
 .segment "IEEESWTCH"
 
+ieeeswitch_init:
+	jsr jsrfar
+	.word $c000 + 3 * 15 ; cbdos_init
+	.byte BANK_CBDOS
+	rts
+
 secnd:
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_secnd
-:	jsr jsrfar
+	bit cbdos_flags
+	bpl :+
+	jsr upload_time
+	jsr jsrfar
 	.word $c000 + 3 * 0
 	.byte BANK_CBDOS
 	rts
+:	jmp serial_secnd
 
 tksa:
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_tksa
-:	jsr jsrfar
+	bit cbdos_flags
+	bvc :+
+	jsr jsrfar
 	.word $c000 + 3 * 1
 	.byte BANK_CBDOS
 	rts
+:	jmp serial_tksa
 
 acptr:
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_acptr
-:	jsr jsrfar
+	bit cbdos_flags
+	bvc :+
+	jsr jsrfar
 	.word $c000 + 3 * 2
 	.byte BANK_CBDOS
 	rts
+:	jmp serial_acptr
 
 ciout:
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_ciout
-:	jsr jsrfar
+	bit cbdos_flags
+	bpl :+
+	jsr jsrfar
 	.word $c000 + 3 * 3
 	.byte BANK_CBDOS
 	rts
+:	jmp serial_ciout
 
 untlk:
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_untlk
-:	jsr jsrfar
+	bit cbdos_flags
+	bvc :+
+	jsr jsrfar
 	.word $c000 + 3 * 4
 	.byte BANK_CBDOS
 	rts
+:	jmp serial_untlk
 
 unlsn:
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_unlsn
-:	jsr jsrfar
+	bit cbdos_flags
+	bpl :+
+	jsr jsrfar
 	.word $c000 + 3 * 5
 	.byte BANK_CBDOS
 	rts
+:	jmp serial_unlsn
 
 listn:
-	jsr cbdos_detect
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_listn
-:	jsr jsrfar
+	pha
+	jsr jsrfar
 	.word $c000 + 3 * 6
 	.byte BANK_CBDOS
-	rts
+	bcs @1 ; no CBDOS device
 
-talk:
-	jsr cbdos_detect
-	bit cbdos_enabled
-	bmi :+
-	jmp serial_talk
-:	jsr jsrfar
-	.word $c000 + 3 * 7
-	.byte BANK_CBDOS
-	rts
-
-cbdos_detect:
-	pha
-	lda cbdos_enabled
-	beq :+
+	lda cbdos_flags
+	ora #$80
+	sta cbdos_flags
 	pla
 	rts
 
-:	phx
-	phy
+@1:	lda cbdos_flags
+	and #$ff-$80
+	sta cbdos_flags
+	pla
+	jmp serial_listn
 
-	php
-	sei
+talk:
+	pha
 	jsr jsrfar
-	.word $c000 + 3 * 15
+	.word $c000 + 3 * 7
 	.byte BANK_CBDOS
-	beq @detected
-	lda #0
-	bra :+
-@detected:
-	lda #$80
-:	sta cbdos_enabled
-	plp
-	ply
-	plx
+	bcs @1 ; no CBDOS device
+
+	lda cbdos_flags
+	ora #$40
+	sta cbdos_flags
+	pla
+	rts
+
+@1:	lda cbdos_flags
+	and #$ff-$40
+	sta cbdos_flags
+	pla
+	jmp serial_talk
+
+macptr:
+	bit cbdos_flags
+	bvs :+
+	sec ; error: unsupported
+	rts
+:	jsr jsrfar
+	.word $c000 + 3 * 17
+	.byte BANK_CBDOS
+	clc
+	rts
+
+
+; Called by SECOND: If it's a CLOSE command, upload the curent time.
+upload_time:
+	pha
+	and #$f0
+	cmp #$e0 ; CLOSE
+	beq @0
+	pla
+	rts
+@0:
+	ldx #2
+@1:	lda 0,x
+	pha
+	inx
+	cpx #9
+	bne @1
+
+	jsr clock_get_date_time
+
+	; convert from 1900 to 1980
+	; 1900 -> no time information (255)
+	lda 2
+	bne @2
+	dec
+	bra @3
+@2:	sec
+	sbc #80
+@3:	sta 2
+
+	jsr jsrfar
+	.word $c000 + 3 * 16
+	.byte BANK_CBDOS
+
+	ldx #8
+@4:	pla
+	sta 0,x
+	dex
+	cpx #1
+	bne @4
+
 	pla
 	rts

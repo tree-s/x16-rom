@@ -3,6 +3,9 @@
 ;----------------------------------------------------------------------
 ; (C)2020 Michael Steil, License: 2-clause BSD
 
+.include "fat32/fat32.inc"
+.include "fat32/sdcard.inc"
+
 .import sdcard_init
 
 .import fat32_init
@@ -16,7 +19,7 @@
 .import dir_open, dir_read
 
 ; functions.s
-.export cbdos_init
+.export cbdos_init, cbdos_unit, disk_changed
 .import cur_medium
 
 ; parser.s
@@ -27,8 +30,8 @@
 .export channel, context_for_channel, ieee_status
 
 ; jumptab.s
-.export cbdos_secnd, cbdos_tksa, cbdos_acptr, cbdos_ciout, cbdos_untlk, cbdos_unlsn, cbdos_listn, cbdos_talk
-.export cbdos_sdcard_detect
+.export cbdos_secnd, cbdos_tksa, cbdos_acptr, cbdos_ciout, cbdos_untlk, cbdos_unlsn, cbdos_listn, cbdos_talk, cbdos_macptr
+.export cbdos_set_time
 
 .include "banks.inc"
 
@@ -57,80 +60,134 @@ via1porta   = via1+1 ; RAM bank
 .segment "cbdos_data"
 
 ; Commodore DOS variables
-initialized:
+cbdos_unit:
 	.byte 0
-MAGIC_INITIALIZED  = $7A
+no_sdcard_active: ; $00: SD card active; $80: no SD card active
+	.byte 0
 listen_cmd:
 	.byte 0
 channel:
 	.byte 0
+cur_context:
+	.byte 0
 is_receiving_filename:
+	.byte 0
+disk_changed:
 	.byte 0
 
 context_for_channel:
 	.res 16, 0
 CONTEXT_NONE = $ff
 CONTEXT_DIR  = $fe
+CONTEXT_CMD  = $fd
 
 .segment "cbdos"
 
 ;---------------------------------------------------------------
-; Initialize CBDOS data structures
+; Initialize CBDOS
 ;
-; This has to be done once and is triggered by
-; cbdos_sdcard_detect.
+; This is called once on a system RESET.
 ;---------------------------------------------------------------
 cbdos_init:
-	lda #MAGIC_INITIALIZED
-	cmp initialized
-	bne :+
+	BANKING_START
+	lda #8
+	sta cbdos_unit
+	; SD card needs detection and init
+	lda #$80
+	sta no_sdcard_active
+	; SD card detection will trigger a call to reset_dos
+
+	lda #$73
+	jsr set_status
+
+	BANKING_END
 	rts
 
-:	sta initialized
-	phx
-	phy
+;---------------------------------------------------------------
+; sdcard_check
+;
+; This is called by every TALK and LISTEN:
+; * If there is an active SD card, verify it is still present.
+;   If no, try to detect one.
+; * If there is no active SD card, try to detect one.
+;
+; Out:  c  =0: OK
+;          =1: device not present
+;---------------------------------------------------------------
+sdcard_check:
+	BANKING_START
 
+	cmp cbdos_unit
+	beq @1
+	sec
+	rts
+
+@1:	bit no_sdcard_active
+	bmi @not_active
+
+	; SD card was there - make sure it is still there
+	jsr sdcard_check_alive; cheap, not state destructive
+	bcs @yes
+
+@not_active:
+	lda #1
+	sta disk_changed
+	; no SD card was there - maybe there is now, so
+	; try to init it
+	jsr sdcard_init ; expensive, state destructive
+	bcc @no
+
+	jsr reset_dos
+
+@yes:	lda #0
+	bra @end
+@no:	lda #$80
+@end:	sta no_sdcard_active
+	asl
+	BANKING_END
+	rts
+
+;---------------------------------------------------------------
+; reset_dos
+;
+; Reset CBDOS after a new SD card has been inserted
+;
+; Whenever an SD card is inserted, all state is cleared.
+; The status messages is preserved.
+;---------------------------------------------------------------
+reset_dos:
 	ldx #14
 	lda #CONTEXT_NONE
 :	sta context_for_channel,x
 	dex
 	bpl :-
+	lda #CONTEXT_CMD
+	sta context_for_channel + 15
 
-	lda #$73
-	jsr set_status
-
-	; TODO error handling
 	jsr fat32_init
 
 	lda #1
 	sta cur_medium
 
-	ply
-	plx
 	rts
 
 ;---------------------------------------------------------------
-; Detect SD card
-;
-; Returns Z=1 if SD card is present
+; cbdos_set_time
 ;---------------------------------------------------------------
-cbdos_sdcard_detect:
+cbdos_set_time:
 	BANKING_START
-	jsr cbdos_init
-
-.if 0
-	; re-init the SD card
-	; * first write back any dirty sectors
-	jsr sync_sector_buffer
-	; * then init it
-	jsr sdcard_init
-
-	lda #0
-	rol
-	eor #1          ; Z=0: error
-.else
-	lda #0
-.endif
+	lda 2
+	sta fat32_time_year
+	lda 3
+	sta fat32_time_month
+	lda 4
+	sta fat32_time_day
+	lda 5
+	sta fat32_time_hours
+	lda 6
+	sta fat32_time_minutes
+	lda 7
+	sta fat32_time_seconds
 	BANKING_END
 	rts
 
@@ -140,7 +197,7 @@ cbdos_sdcard_detect:
 ; Nothing to do.
 ;---------------------------------------------------------------
 cbdos_listn:
-	rts
+	jmp sdcard_check
 
 ;---------------------------------------------------------------
 ; SECOND (after LISTEN)
@@ -175,8 +232,10 @@ cbdos_secnd:
 ; special-case command channel:
 ; ignore OPEN/CLOSE
 	cmp #15
-	beq @secnd_rts
-
+	bne :+
+	stz ieee_status
+	bra @secnd_rts
+:
 	stz is_receiving_filename
 
 	lda listen_cmd
@@ -186,16 +245,12 @@ cbdos_secnd:
 	beq @second_close
 
 ; switch to context
-	jsr file_second
+	jsr file_second2
 	bra @secnd_rts
 
 ;---------------------------------------------------------------
 ; CLOSE
 @second_close:
-	ldx channel
-	lda context_for_channel,x
-	bmi @secnd_rts
-
 	jsr file_close_clr_channel
 	bra @secnd_rts
 
@@ -263,12 +318,14 @@ cbdos_unlsn:
 
 ; special-case command channel
 	lda channel
-	cmp #$0f
+	cmp #15
 	beq @unlisten_cmdch
 
 	lda listen_cmd
 	cmp #$f0
 	bne @unlsn_end; != OPEN? -> UNLISTEN does nothing
+
+	jsr file_close_clr_channel
 
 ;---------------------------------------------------------------
 ; Execute OPEN with filename
@@ -292,14 +349,10 @@ cbdos_unlsn:
 ;---------------------------------------------------------------
 ; OPEN file
 @unlsn_open_file:
-	ldx channel
-	lda context_for_channel,x
-	bmi @not_open
-
-	jsr file_close
-
-@not_open:
 	jsr file_open
+	bcs @unlsn_end
+	ldx channel
+	sta context_for_channel,x
 	bra @unlsn_end
 
 ;---------------------------------------------------------------
@@ -326,7 +379,7 @@ cbdos_unlsn:
 ; Nothing to do.
 ;---------------------------------------------------------------
 cbdos_talk:
-	rts
+	jmp sdcard_check
 
 
 ;---------------------------------------------------------------
@@ -340,13 +393,22 @@ cbdos_tksa: ; after talk
 	and #$0f
 	sta channel
 
-	jsr file_second
+	jsr file_second2
+
 
 	ply
 	plx
 	BANKING_END
 	rts
 
+;---------------------------------------------------------------
+file_second2:
+	ldx channel
+	lda context_for_channel,x
+	sta cur_context
+	bmi @2 ; not a file context
+	jmp file_second
+@2:	rts
 
 ;---------------------------------------------------------------
 ; RECEIVE
@@ -356,26 +418,11 @@ cbdos_acptr:
 	phx
 	phy
 
-	ldx channel
-	cpx #15
-	beq @acptr_status
+	lda cur_context
+	bmi @nacptr_file
 
-	lda context_for_channel,x
-	bpl @acptr_file ; actual file
-
-	cmp #CONTEXT_DIR
-	beq @acptr_dir
-
-; *** NONE
-	; #CONTEXT_NONE
-	lda #$42 ; EOI + timeout/file not found
-	ora ieee_status
-	sta ieee_status
-	lda #199
-	bra @acptr_end
-
+;---------------------------------------------------------------
 ; *** FILE
-@acptr_file:
 	jsr file_read
 	bcs @acptr_end_file_eoi
 @acptr_end_ok:
@@ -387,41 +434,57 @@ cbdos_acptr:
 	BANKING_END
 	rts
 
+@nacptr_file:
+	cmp #CONTEXT_CMD
+	bne @nacptr_status
+
+;---------------------------------------------------------------
+; *** STATUS
+	jsr cmdch_read
+
+@acptr_eval:
+	bcc @acptr_end_ok
+	bra @acptr_eoi
+
+@nacptr_status:
+	cmp #CONTEXT_DIR
+	bne @nacptr_dir
+
+;---------------------------------------------------------------
+; *** DIR
+	jsr dir_read
+	bra @acptr_eval
+
+;---------------------------------------------------------------
+; *** NONE
+@nacptr_dir:
+	; #CONTEXT_NONE
+	lda #$42 ; EOI + timeout/file not found
+	ora ieee_status
+	sta ieee_status
+	lda #199
+	bra @acptr_end
+
+
 @acptr_end_file_eoi:
-	ldx channel
-	ldy context_for_channel,x
-	bmi @acptr_eoi
-
 	pha ; data byte
-	tya
 	jsr file_close_clr_channel
-
+	pla
 @acptr_eoi:
+	pha
 	lda #$40 ; EOI
 	ora ieee_status
 	sta ieee_status
 	pla ; data byte
 	bra @acptr_end
 
-@acptr_dir:
-; *** DIR
-	jsr dir_read
-	bra @acptr_eval
-
-; *** STATUS
-@acptr_status:
-	jsr cmdch_read
-
-@acptr_eval:
-	bcc @acptr_end_ok
-	pha
-	bra @acptr_eoi
-
-
 ;---------------------------------------------------------------
 file_close_clr_channel:
-	jsr file_close
 	ldx channel
+	lda context_for_channel,x
+	bmi @1
+	jsr file_close
+@1:	ldx channel
 	lda #CONTEXT_NONE
 	sta context_for_channel,x
 	rts
@@ -432,5 +495,47 @@ file_close_clr_channel:
 cbdos_untlk:
 	rts
 
+;---------------------------------------------------------------
+; BLOCK-WISE RECEIVE
+;
+; In:   y:x  pointer to data
+;       a    number of bytes to read
+;            =0: implementation decides; up to 512
+; Out:  y:x  number of bytes read
+;       c    =1: unsupported
+;       (EOI flag in ieee_status)
+;---------------------------------------------------------------
+cbdos_macptr:
+	.importzp fat32_ptr
+	BANKING_START
+	bit cur_context
+	bmi @1
+
+	stz ieee_status
+
+	jsr file_read_block ; read up to 256 bytes
+	bcc @end
+
+	phx
+	phy
+	jsr file_close_clr_channel
+	lda #$40 ; EOI
+	ora ieee_status
+	sta ieee_status
+	clc
+	ply
+	plx
+
+@end:
+	BANKING_END
+	rts
+
+
+@1:	sec ; error: unsupported
+	bra @end
+
+
+;---------------------------------------------------------------
 .segment "IRQB"
 	.word banked_irq
+

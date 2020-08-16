@@ -10,7 +10,7 @@
 
 ; fat32.s
 .import load_mbr_sector, write_sector, clear_buffer, fat32_dirent, fat32_get_ptable_entry
-.import set_errno, fat32_errno
+.import set_errno, fat32_errno, unmount
 
 .export fat32_mkfs
 
@@ -18,6 +18,9 @@ RESERVED_SECTORS_DEFAULT = 32
 MAX_SECTORS_PER_CLUSTER_SHIFT = 7
 
 .bss
+
+; These are temporary and don't carry any state across calls to fat32_mkfs,
+; so don't have to be cleared.
 
 sectors_per_cluster_shift:
 	.byte 0
@@ -65,6 +68,11 @@ fat32_mkfs:
 	stx oemname_ptr
 	ldx fat32_bufptr + 1
 	stx oemname_ptr + 1
+
+	pha
+	jsr unmount
+	pla
+	bcc @error
 
 	; Get start and size of partition
 	jsr fat32_get_ptable_entry
