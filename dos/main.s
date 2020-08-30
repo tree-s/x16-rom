@@ -16,7 +16,7 @@
 .import cmdch_exec, set_status, cmdch_read
 
 ; dir.s
-.import dir_open, dir_read
+.import dir_open, dir_close, dir_read
 
 ; functions.s
 .export dos_init, dos_unit, disk_changed
@@ -251,7 +251,12 @@ dos_secnd:
 ;---------------------------------------------------------------
 ; CLOSE
 @second_close:
-	jsr file_close_clr_channel
+	ldx channel
+	lda context_for_channel,x
+	cmp #CONTEXT_DIR
+	bne :+
+	jsr dir_close
+:	jsr file_close_clr_channel
 	bra @secnd_rts
 
 ;---------------------------------------------------------------
@@ -448,7 +453,7 @@ dos_acptr:
 
 @nacptr_status:
 	cmp #CONTEXT_DIR
-	bne @nacptr_dir
+	bne @acptr_none
 
 ;---------------------------------------------------------------
 ; *** DIR
@@ -457,7 +462,7 @@ dos_acptr:
 
 ;---------------------------------------------------------------
 ; *** NONE
-@nacptr_dir:
+@acptr_none:
 	; #CONTEXT_NONE
 	lda #$42 ; EOI + timeout/file not found
 	ora ieee_status
@@ -506,7 +511,6 @@ dos_untlk:
 ;       (EOI flag in ieee_status)
 ;---------------------------------------------------------------
 dos_macptr:
-	.importzp fat32_ptr
 	BANKING_START
 	bit cur_context
 	bmi @1

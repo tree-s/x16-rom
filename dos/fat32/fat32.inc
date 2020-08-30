@@ -11,6 +11,7 @@
 .global fat32_init              ; Initialize FAT32 driver and SD card
 .global fat32_alloc_context     ; Allocate context, result in A if C set
 .global fat32_free_context      ; Free context in A, C set on success
+.global fat32_get_num_contexts  ; Get number of contexts currently in use
 .global fat32_set_context       ; Set current context to idx in A (0..FAT32_CONTEXTS-1)
 .global fat32_get_context       ; Get current context, result in A
 .global fat32_get_free_space    ; Get free space, result in KiB in fat32_size (32-bit)
@@ -43,6 +44,7 @@
 .global fat32_write_byte        ; Write byte in A
 .global fat32_write             ; Write fat32_size (16-bit) bytes from fat32_ptr
 .global fat32_get_offset        ; Get current file offset, result in fat32_size
+.global fat32_seek              ; Set current file offset to fat32_size
 
 .global fat32_size
 .global fat32_dirent
@@ -56,12 +58,6 @@
 .global fat32_time_hours
 .global fat32_time_minutes
 .global fat32_time_seconds
-
-; debug
-.global contexts_inuse
-
-; TODO:
-; fat32_seek
 
 ; Low level fast API
 .global fat32_next_sector
